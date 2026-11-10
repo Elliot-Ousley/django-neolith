@@ -69,4 +69,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install . --group test "Django~=${{ matrix.django }}.0"
       - name: Test (deprecation warnings are errors)
-        run: python -m pytest
+        run: python -m pytest --spec-report spec-report.json
+      # ADR 0018: requirement IDs in spec/, and coverage from the tests that
+      # passed in this run. Coverage is enforced per document, as listed in
+      # tests/spec_trace.toml.
+      - name: Spec trace
+        run: python scripts/spec_trace.py --report spec-report.json
