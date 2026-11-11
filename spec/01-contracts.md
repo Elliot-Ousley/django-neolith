@@ -1,6 +1,6 @@
 # 01. Contracts
 
-**Status:** draft. Identity, actions, the portable type system, publication and checking are specified. Errors are an outline of [ADR 0008](../docs/adr/0008-typed-contract-errors-in-both-modes.md). They become requirements, with their tests, in roadmap steps 2 to 5 (#9 to #12).
+**Status:** draft. Identity, actions, the portable type system, errors, publication and checking are specified. How transports and the provider's host produce errors is an outline of [ADR 0008](../docs/adr/0008-typed-contract-errors-in-both-modes.md). It becomes requirements, with their tests, in roadmap steps 3 to 5 (#10 to #12).
 
 ## Identity and versioning
 
@@ -52,7 +52,7 @@ The portable forms are the types that every transport can represent, JSON Schema
 
 **CON-14.** A reply type MUST be either a record built only from the portable forms, or empty. An empty reply carries no value.
 
-The encoding of decimal is settled by the in-process transport (step 3 of the [roadmap](../docs/roadmap.md), issue #10). **CON-21.** Until that encoding is settled, an implementation MUST reject a contract whose request or reply type uses decimal, before it serves the contract or calls any of its actions. The rejection names the contract, the action and the field.
+The encoding of decimal is settled by the in-process transport (step 3 of the [roadmap](../docs/roadmap.md), issue #10). **CON-21.** Until that encoding is settled, an implementation MUST reject a contract whose request type, reply type or detail record (CON-8) uses decimal, before it serves the contract or calls any of its actions. The rejection names the contract, the action and the field.
 
 Records are nominal within a contract and structural across the wire. **CON-15.** Two different records or enums used by one contract MUST NOT have the same name. Generated code for other languages names each record and enum once, so two with one name would collide.
 
@@ -62,7 +62,7 @@ Records are nominal within a contract and structural across the wire. **CON-15.*
 
 ## Errors
 
-Every action's error set includes the standard kinds, whether declared or not:
+An action's *error set* is the standard kinds below, which every action has whether it declares them or not, and the kinds the action declares.
 
 | Kind | Meaning | Retry safe |
 |---|---|---|
@@ -77,14 +77,33 @@ Every action's error set includes the standard kinds, whether declared or not:
 
 **CON-8.** A contract MAY declare additional error kinds per action, each with a typed detail record. Error kinds are part of the contract and follow its compatibility rules.
 
-In outline:
+**CON-22.** An error kind MUST match the rule `segment` of the grammar under "Identity and versioning". Every standard kind does.
 
-- An error that crosses a contract carries its kind and a message and, for a declared kind, its detail record.
+**CON-23.** A declared error kind MUST NOT have the name of a standard kind or a reserved name. The reserved names are `cancelled`, `unknown`, `deadline_exceeded`, `already_exists`, `resource_exhausted`, `failed_precondition`, `aborted`, `out_of_range`, `unimplemented` and `data_loss`, the remaining status codes of gRPC. A later version of this specification adds standard kinds only from the reserved names, so an added standard kind never has the name of a kind a contract declares.
+
+**CON-24.** A detail record MUST be a record built only from the portable forms whose values nest at most 32 levels deep in records, maps and lists, the detail record being the first, so that a caller that does not know its kind can hold it as an untyped map (CON-30). A record that contains itself can nest without limit. Its records and enums share the contract's names with those of the request and reply types (CON-15, CON-20).
+
+**CON-25.** An error that crosses a contract MUST carry its kind and a message of Unicode text, which holds no lone surrogate, since JSON text cannot carry one.
+
+**CON-26.** An error of a standard kind MUST NOT carry a detail.
+
+**CON-27.** An error of a declared kind MUST carry the kind's detail record.
+
+**CON-28.** When an error's kind is neither a standard kind the caller knows nor a kind its version of the contract declares, the caller MUST receive the error with that kind, not as `internal`, and with its detail, if there is one, as an untyped map from the detail's field names to their values, unless the detail breaks CON-30. A provider that meets CON-31 never sends such a detail; what the caller receives then is settled with the connectors in roadmap step 3. Adding an error kind to an action is a compatible change (CON-1), and a later version of this specification can add a standard kind (CON-23), so a caller can receive a kind it does not know.
+
+**CON-30.** An untyped map MUST hold only text keys and values that are untyped maps, lists, text, booleans, null, integers from −(2^53−1) to 2^53−1 or finite numbers, nested at most 32 levels deep, the outermost map being the first, and holding at most 10,000 values in all, counting every map value and list item at every depth, with each occurrence of a repeated value counted separately. Its text is Unicode text, as in CON-25. The integer range is the one every JSON reader holds exactly (I-JSON, RFC 7493, section 2.2), narrower than the 64-bit portable integer.
+
+**CON-31.** The value of a detail record, as it travels, MUST meet the bounds of an untyped map (CON-30), so that a caller that does not know its kind can hold it (CON-28). CON-24 makes the depth bound hold for every value of a detail record; the other bounds depend on the value, so the provider's host checks them as it sends the error.
+
+**CON-32.** Until the encoding of bytes is settled with the in-process transport (step 3 of the [roadmap](../docs/roadmap.md), issue #10), an implementation MUST reject a contract whose detail record uses bytes, before it serves the contract or calls any of its actions, since whether such a detail travels within CON-30 depends on that encoding. The rejection names the contract, the action and the error kind.
+
+**CON-29.** A mistake in the calling code, such as a call to an action the contract does not have, MUST NOT be reported as a contract error. It reports a bug in the calling code, not the outcome of a call, so code that handles contract errors does not swallow it.
+
+How transports and the provider's host produce errors becomes requirements together with them, in roadmap steps 3 to 5. In outline:
+
 - Only hosts and transports produce `unavailable` and `timeout`. A provider's action produces any other standard kind, or a kind the action declares.
 - A failure of a provider's action that is not an error of its error set, an `unavailable` or `timeout` that the action produces, and a failure of the provider's host itself reach the caller as `internal`. A signal to stop, such as cancellation or the process exiting, is not a failure of the action and is not converted. The `internal` error's message is fixed text with the trace identifier, and nothing of the original failure crosses. The provider's host records the original with the trace identifier.
 - An error that a provider's action receives from one of its own outgoing calls, and lets end the action, reaches its caller as `internal`. Passing a nested error on takes a new error produced by the action.
-- A caller whose version of the contract does not know a kind receives an error with that kind, and with its detail as an untyped value.
-- A mistake in the calling code, such as a call to an action the contract does not have, is not a contract error.
 
 Decision record: [0008](../docs/adr/0008-typed-contract-errors-in-both-modes.md).
 
@@ -92,11 +111,11 @@ Decision record: [0008](../docs/adr/0008-typed-contract-errors-in-both-modes.md)
 
 **CON-9.** A contract MUST be publishable as a neutral description of its actions, types and errors. For the HTTP transport this is OpenAPI 3.1 ([03](03-http-transport.md)). Other transports define their own projection. The projection is derived from the contract, never hand-written.
 
-**CON-16.** The neutral description MUST give, for each action, its name, whether it is idempotent, the JSON Schema (draft 2020-12) of its request type, and the JSON Schema of its reply type unless the reply is empty. Each record and enum is described once and referenced by name, and a value that travels validates against the description.
+**CON-16.** The neutral description MUST give, for each action, its name, whether it is idempotent, the JSON Schema (draft 2020-12) of its request type, the JSON Schema of its reply type unless the reply is empty, and each error kind it declares with the JSON Schema of the kind's detail record. The standard kinds are not listed, since every action has them. Each record and enum is described once and referenced by name, and a value that travels validates against the description.
 
 ## Checking a contract
 
-**CON-17.** An implementation MUST reject a contract that does not meet CON-10, CON-11, CON-12, CON-13, CON-14, CON-15 or CON-20, or whose records cannot ignore unknown fields as CON-6 and CON-7 require, before it serves the contract or calls any of its actions. The rejection names the contract, the action and, for a type, the field.
+**CON-17.** An implementation MUST reject a contract that does not meet CON-10, CON-11, CON-12, CON-13, CON-14, CON-15, CON-20, CON-22, CON-23 or CON-24, or whose records cannot ignore unknown fields as CON-6 and CON-7 require, before it serves the contract or calls any of its actions. The rejection names the contract, the action, the error kind where there is one and, for a type, the field.
 
 **CON-18.** A provider MUST implement every action of its contract, taking the action's request type and returning its reply type.
 
