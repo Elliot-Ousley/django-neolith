@@ -23,9 +23,15 @@ The context travels in headers. The calling app's credential travels in `Authori
 | `Neolith-Principal` | The principal on whose behalf the call is made, if there is one ([below](#the-principal)) |
 | `Idempotency-Key` | The idempotency key |
 | `traceparent` | The trace identifier, per W3C Trace Context |
-| `Neolith-Timeout` | The remaining time budget, in whole milliseconds |
+| `Neolith-Timeout` | The remaining time budget, in whole milliseconds, rounded down |
 
-The deadline is sent as a relative budget, not an absolute time, so that the deadline does not depend on synchronised clocks. The receiving host computes its own local deadline from the budget when the request arrives.
+The deadline is sent as a relative budget, not an absolute time, so that the deadline does not depend on synchronised clocks. The receiving host computes its own local deadline from the budget when the request arrives. In outline, following [ADR 0017](../docs/adr/0017-call-context-explicit-at-the-action-ambient-for-propagation.md):
+
+- `Neolith-Timeout` is 1 to 10 ASCII digits, the first not `0` (`%x31-39 0*9DIGIT`). That is stricter than Connect's `Connect-Timeout-Ms`, a positive integer of at most 10 digits, which does not rule out a leading zero. An absent header means the call has no deadline. A caller never sends 0: a call whose budget rounds down to 0 ms fails with `timeout` before it is sent. A provider's host fails a call whose header is present but does not match, such as `0050`, with `invalid_argument`. In every mode, a budget above 9999999999 ms counts as 9999999999, and a provider's host can cap it lower, at a maximum of its own.
+- `traceparent` follows W3C Trace Context, including its rules for versions above `00`. One that is absent or invalid starts a fresh trace, and `tracestate` is then dropped; otherwise `tracestate` is passed on.
+- `Idempotency-Key` carries the call's key: one derived from its parent's key as in [02](02-transports.md), or a random one at a root. The IETF Idempotency-Key draft makes it a structured-field String (RFC 9651); neolith narrows that to a String of 1 to 255 characters, counted after unescaping, with no parameters. One that does not match fails the call with `invalid_argument`. A call that arrives without one has no key, so the calls it makes get random keys, and a retry of it does not reproduce them.
+
+These become requirements, with their tests, with the HTTP transport in roadmap step 5 (#12).
 
 ## Errors
 
@@ -59,22 +65,22 @@ Two identities cross with a call ([ADR 0010](../docs/adr/0010-pluggable-principa
 
 A host with several backends tries them in a configured order. The first that recognizes a call's credentials decides, by resolving them or refusing the call, and a backend that does not recognize them abstains.
 
-Base64url-encoded values here use the base64url alphabet only (RFC 4648, section 5), with no padding, no whitespace and zero unused bits. JSON objects here are I-JSON (RFC 7493), so a duplicate member name or a lone surrogate makes one invalid, and integers are JSON numbers with no fraction or exponent, within ±(2^53 − 1).
+Base64url-encoded values here use the base64url alphabet only (RFC 4648, section 5), with no padding, no whitespace and zero unused bits. JSON objects here meet the I-JSON rule of [ADR 0019](../docs/adr/0019-wire-encodings-of-the-portable-forms.md), so a duplicate member name or a lone surrogate makes one invalid while a noncharacter such as U+FFFF does not, and integers are JSON numbers with no fraction or exponent, within ±(2^53 − 1).
 
-On a contract path, the provider's host authenticates the calling app before it reads the request body or any call-context header. A call on a contract path whose credential is missing, is recognized by no backend or does not resolve, or that reaches a host with no backend, fails with `unauthenticated`. It then checks the principal, as below, before it validates the request body. A request on any other path is answered as the Errors section says. In-process there are no credentials: the calling app is the app the call is made from. A call made from no app fails with `unauthenticated` on every transport.
+On a contract path, the provider's host authenticates the calling app before it reads the request body or any call-context header. A call on a contract path whose credential is missing, is recognized by no backend or does not resolve, or that reaches a host with no backend, fails with `unauthenticated`. It runs its other checks, the request body last, in the order of [ADR 0017](../docs/adr/0017-call-context-explicit-at-the-action-ambient-for-propagation.md) Decision 9. A request on any other path is answered as the Errors section says. In-process there are no credentials: the calling app is the app the call is made from. A call made from no app fails with `unauthenticated` on every transport.
 
 ### The principal
 
 A *principal object* is a JSON object with exactly the members `issuer` and `subject`, both non-empty strings, and optionally `claims`, an object whose values are strings, integers, booleans or lists of strings. An absent `claims` is the same as an empty one. Two principals are equal when their members are equal, with strings compared code point by code point and without Unicode normalization, and lists compared in order. A subject is unique only within its issuer, so code that stores a principal stores both.
 
-With the shared-secret backend, `Neolith-Principal` is present exactly when the call has a principal, and carries it as a bare assertion: a principal object, base64url-encoded, in at most 4096 bytes. A header with an empty value counts as present. A bare assertion that is not a principal object, encoded as above, fails the call with `invalid_argument`, once the calling app has been authenticated and found on the allow-list below.
+With the shared-secret backend, `Neolith-Principal` is present exactly when the call has a principal, and carries it as a bare assertion: a principal object, base64url-encoded, with the encoding at most 4096 bytes. A caller sends the object's *sent form*: its JCS serialization (RFC 8785) in UTF-8, with `claims` left out when empty. A provider accepts any serialization that meets these rules. No valid serialization of a principal object is shorter than its sent form, so a principal that arrived in a valid header still fits when the provider passes it on in calls of its own. A header with an empty value counts as present. A bare assertion that is not a principal object, encoded as above, fails the call with `invalid_argument`, once the calling app has been authenticated and found on the allow-list below. A neolith caller never sends one, because it checks the principal's sent form against these rules first, in every mode, in the order of [ADR 0017](../docs/adr/0017-call-context-explicit-at-the-action-ambient-for-propagation.md) Decision 9. A provider receives the principal decoded from that form.
 
 The principal is not signed: the authenticated calling app asserts it, and it never goes inside the shared-secret token. A provider accepts `Neolith-Principal` only from a calling app on its allow-list of apps that may assert a principal. A call from any other calling app that carries the header fails with `permission_denied`, whatever the header holds. A later backend can carry a signed delegation token in this header instead of the bare assertion, under its own format.
 
-For example, the principal `{"issuer":"https://id.example.com","subject":"u-81f3","claims":{"roles":["clerk"]}}` is sent as:
+For example, the principal with issuer `https://id.example.com`, subject `u-81f3` and the claim `roles` holding `["clerk"]` has the sent form `{"claims":{"roles":["clerk"]},"issuer":"https://id.example.com","subject":"u-81f3"}` and is sent as:
 
 ```
-Neolith-Principal: eyJpc3N1ZXIiOiJodHRwczovL2lkLmV4YW1wbGUuY29tIiwic3ViamVjdCI6InUtODFmMyIsImNsYWltcyI6eyJyb2xlcyI6WyJjbGVyayJdfX0
+Neolith-Principal: eyJjbGFpbXMiOnsicm9sZXMiOlsiY2xlcmsiXX0sImlzc3VlciI6Imh0dHBzOi8vaWQuZXhhbXBsZS5jb20iLCJzdWJqZWN0IjoidS04MWYzIn0
 ```
 
 ### Shared-secret tokens
