@@ -12,8 +12,10 @@ license-files = ["LICENSE"]
 authors = [{ name = "Vignesh Pai and django-neolith contributors" }]
 requires-python = ">=3.12"
 # Runtime dependencies need an Accepted decision record (CONTRIBUTING K5).
-# Floor and milestone: ADR 0012.
-dependencies = ["Django>=5.2"]
+# Django: ADR 0012 sets the floor and milestone. Pydantic: ADR 0006 makes
+# contract types Pydantic v2 models; 2.12 is the oldest release the suite has
+# been run against.
+dependencies = ["Django>=5.2", "pydantic>=2.12,<3"]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Framework :: Django",
@@ -38,8 +40,21 @@ Changelog = "https://github.com/vignzpie/django-neolith/blob/main/CHANGELOG.md"
 [dependency-groups]
 # markdown-it-py: the spec trace parses spec/ as CommonMark (ADR 0018). Development
 # and CI only, never a runtime dependency; pinned so the parse cannot drift.
-test = ["pytest>=8.4", "pytest-django>=4.11", "packaging>=25", "markdown-it-py==4.2.0"]
-lint = ["ruff>=0.14", "mypy>=1.18", "django-stubs>=5.2"]
+# hypothesis, hypothesis-jsonschema and jsonschema: the contract round-trip
+# property test (spec 01, CON-16). Test only.
+test = [
+    "pytest>=8.4",
+    "pytest-django>=4.11",
+    "packaging>=25",
+    "markdown-it-py==4.2.0",
+    "hypothesis>=6.170",
+    "hypothesis-jsonschema>=0.23.2",
+    "jsonschema>=4.26",
+    # The property test checks "date" and "date-time" formats; jsonschema needs
+    # this to check "date-time" and otherwise skips it silently.
+    "rfc3339-validator>=0.1.4",
+]
+lint = ["ruff>=0.14", "mypy>=1.18", "django-stubs>=5.2", "types-jsonschema>=4.26"]
 dev = [{ include-group = "test" }, { include-group = "lint" }]
 
 [tool.hatch.version]
@@ -108,6 +123,12 @@ files = ["src", "tests", "scripts"]
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 plugins = ["mypy_django_plugin.main"]
+
+[[tool.mypy.overrides]]
+# These tests build contract declarations from free functions, whose "..."
+# bodies mypy accepts only inside a Protocol class.
+module = "tests.test_contracts"
+disable_error_code = ["empty-body"]
 
 [tool.django-stubs]
 django_settings_module = "tests.settings"
