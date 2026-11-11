@@ -2,7 +2,7 @@
 
 The script reads the specification and ``tests/spec_trace.toml``. Coverage
 comes from the report that ``scripts/spec_trace_plugin.py`` writes when pytest
-runs with ``--spec-report PATH``: only a test that ran and passed covers the
+runs with ``--spec-report=PATH``: only a test that ran and passed covers the
 requirements it cites.
 
 The specification is parsed with markdown-it-py, a CommonMark parser, with
@@ -53,7 +53,7 @@ a problem, so the gate cannot be skipped by leaving the report out.
 
 Usage::
 
-    python -m pytest --spec-report spec-report.json
+    python -m pytest --spec-report=spec-report.json
     python scripts/spec_trace.py --report spec-report.json
     python scripts/spec_trace.py              # the specification only
 """
@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import tomllib
@@ -601,11 +602,16 @@ def render(trace: Trace) -> str:
     return "\n".join(lines)
 
 
+def _expanded(value: str) -> Path:
+    """A path with ``~`` and environment variables expanded, as the plugin does."""
+    return Path(os.path.expanduser(os.path.expandvars(value)))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--report",
-        type=Path,
+        type=_expanded,
         metavar="PATH",
         help="the report written by pytest --spec-report",
     )

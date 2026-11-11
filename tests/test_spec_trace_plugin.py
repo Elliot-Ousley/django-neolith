@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
 
 ARGS = ("-p", "scripts.spec_trace_plugin", "-p", "no:django", "-p", "no:cacheprovider")
 
@@ -16,7 +22,7 @@ def run(pytester: pytest.Pytester, source: str, *args: str) -> Tests:
     """Run ``source`` as a test module and return the report's tests."""
     pytester.makeini("[pytest]\nmarkers =\n    spec(*ids): requirement IDs\n")
     pytester.makepyfile(test_example=source)
-    pytester.runpytest(*ARGS, "--spec-report", "report.json", *args)
+    pytester.runpytest(*ARGS, "--spec-report=report.json", *args)
     report = json.loads((pytester.path / "report.json").read_text())
     assert report["format"] == 1
     tests: Tests = report["tests"]
@@ -162,7 +168,7 @@ def test_dropped(): pass
 def test_marker_arguments_must_be_ids(pytester: pytest.Pytester, marker: str) -> None:
     pytester.makeini("[pytest]\nmarkers =\n    spec(*ids): requirement IDs\n")
     pytester.makepyfile(f"import pytest\n\n@{marker}\ndef test_it(): pass\n")
-    result = pytester.runpytest(*ARGS, "--spec-report", "report.json")
+    result = pytester.runpytest(*ARGS, "--spec-report=report.json")
     assert result.ret == pytest.ExitCode.USAGE_ERROR
     result.stderr.fnmatch_lines(["*the spec marker takes one or more requirement IDs*"])
 
@@ -173,3 +179,143 @@ def test_no_report_without_the_option(pytester: pytest.Pytester) -> None:
     )
     pytester.runpytest(*ARGS).assert_outcomes(passed=1)
     assert not (pytester.path / "report.json").exists()
+
+
+@pytest.mark.parametrize("value", ["~/report.json", "$REPORTS/report.json"])
+def test_home_and_variables_are_expanded(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    # A shell does not expand "~" after "=", so the plugin does, as --junitxml
+    # does.
+    pytester.mkdir("home")
+    monkeypatch.setenv("HOME", str(pytester.path / "home"))
+    monkeypatch.setenv("REPORTS", str(pytester.path / "home"))
+    pytester.makepyfile(
+        "import pytest\n\n@pytest.mark.spec('CON-1')\ndef test_it(): pass\n"
+    )
+    pytester.runpytest(*ARGS, f"--spec-report={value}").assert_outcomes(passed=1)
+    report = json.loads((pytester.path / "home/report.json").read_text())
+    assert list(report["tests"]) == ["test_home_and_variables_are_expanded.py::test_it"]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "new/",
+        "new/.",
+        "new/..",
+        ".",
+        "sub",
+        "afile/report.json",
+        "missing/report.json",
+        "x" * 300,
+    ],
+    ids=[
+        "empty",
+        "slash",
+        "dot",
+        "dot dot",
+        "here",
+        "directory",
+        "under a file",
+        "missing directory",
+        "too long",
+    ],
+)
+def test_a_path_that_cannot_be_opened_is_refused_before_the_run(
+    pytester: pytest.Pytester, value: str
+) -> None:
+    pytester.mkdir("sub")
+    (pytester.path / "afile").write_text("")
+    pytester.makepyfile("def test_it(): pass\n")
+    result = pytester.runpytest(*ARGS, f"--spec-report={value}")
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(["ERROR: --spec-report*"])
+    result.stdout.no_fnmatch_line("*passed*")
+    assert sorted(path.name for path in pytester.path.iterdir()) == [
+        "afile",
+        "sub",
+        "test_a_path_that_cannot_be_opened_is_refused_before_the_run.py",
+    ]
+
+
+@pytest.mark.parametrize("option", ["--help", "--markers"])
+def test_a_command_without_a_session_leaves_the_report_alone(
+    pytester: pytest.Pytester, option: str
+) -> None:
+    (pytester.path / "report.json").write_text("earlier")
+    result = pytester.runpytest(*ARGS, "--spec-report=report.json", option)
+    assert result.ret == pytest.ExitCode.OK
+    assert (pytester.path / "report.json").read_text() == "earlier"
+
+
+def test_a_run_that_dies_in_the_session_leaves_no_earlier_report(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (pytester.path / "report.json").write_text('{"format": 1, "tests": {}}')
+    pytester.makepyfile("import os\n\ndef test_dies(): os._exit(3)\n")
+    monkeypatch.setenv("PYTHONPATH", str(ROOT))
+    result = pytester.runpytest_subprocess(*ARGS, "--spec-report=report.json")
+    assert result.ret == 3
+    assert (pytester.path / "report.json").read_text() == ""
+
+
+@pytest.mark.parametrize(
+    ("option", "outside"),
+    [
+        (["--spec-report", "{}"], False),
+        (["--spec-report={}"], False),
+        (["--spec-report={}"], True),
+    ],
+    ids=["space", "equals", "outside the project"],
+)
+def test_the_option_works_when_the_report_already_exists(
+    tmp_path: Path, option: list[str], outside: bool
+) -> None:
+    # The repository's pytest setup, run twice as the bare pytest command runs
+    # it: in a fresh process, without the current directory on sys.path (-P).
+    # pytest picks conftests from the paths among its arguments before it
+    # loads them, so when the plugin came from a conftest, the second run took
+    # the existing report for a test path. It finds its configuration file
+    # before it loads any plugin, so only "=" works for a report outside the
+    # project.
+    project = tmp_path / "project"
+    for source in [
+        ROOT / "pyproject.toml",
+        *ROOT.glob("scripts/*.py"),
+        *(
+            path
+            for path in ROOT.glob("tests/*.py")
+            if not path.name.startswith("test_")
+        ),
+    ]:
+        target = project / source.relative_to(ROOT)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source.read_text())
+    (project / "tests" / "test_cited.py").write_text(
+        "import pytest\n\n@pytest.mark.spec('CON-1')\ndef test_it(): pass\n"
+    )
+    report = (tmp_path if outside else project) / "spec-report.json"
+    args = [arg.format(report if outside else report.name) for arg in option]
+    # Only this process's pytest on PYTHONPATH, so the project is not, and no
+    # options from the environment, as pytester does.
+    env = {
+        name: value for name, value in os.environ.items() if name != "PYTEST_ADDOPTS"
+    }
+    env["PYTHONPATH"] = str(Path(pytest.__file__).parents[1])
+    for _ in range(2):
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-P", "-m", "pytest", *args],
+            cwd=project,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert result.returncode == pytest.ExitCode.OK, result.stdout + result.stderr
+        assert f"pytest-{pytest.__version__}," in result.stdout
+        assert json.loads(report.read_text())["tests"] == {
+            "tests/test_cited.py::test_it": {"ids": ["CON-1"], "outcome": "passed"}
+        }
