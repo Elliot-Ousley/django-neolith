@@ -19,13 +19,15 @@ written out where they are used.
 """
 
 import copy
+import enum
 import json
 import math
 import re
 import sys
 import types
 from collections.abc import Iterator, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr
@@ -228,6 +230,13 @@ class Portable:
         # record's settings to every node of its fields, so a node is judged
         # together with it, not by its own keys alone.
         self.config: Mapping[str, Any] = {}
+        # Each request, reply and detail record, with the core schema the
+        # walk read for it and the config of its model node, which Pydantic
+        # also passes when it builds the record's serializer and validator
+        # (pydantic/_internal/_model_construction.py, complete_model_class).
+        self.built: dict[
+            type[BaseModel], tuple[Mapping[str, Any], Mapping[str, Any] | None]
+        ] = {}
 
     def fail(self, message: str) -> Exception:
         return self.error(f"{self.where}: {message}")
@@ -239,14 +248,17 @@ class Portable:
         if isinstance(annotation, type) and issubclass(annotation, BaseModel):
             model: type[BaseModel] = annotation
             try:
-                node = self.resolve(self.build(model), model.__name__)
+                schema = self.build(model)
+                node = self.resolve(schema, model.__name__)
                 # A record's before or wrap model_validator wraps the model
                 # node itself.
                 while node.get("type") in _VALIDATORS | _UNCHECKED_VALIDATORS:
                     self.validator(node, f"record {model.__name__}")
                     node = self.resolve(node["schema"], model.__name__)
                 if node.get("type") == "model" and node.get("cls") is model:
-                    return model, self.record(node, model.__name__)
+                    reference = self.record(node, model.__name__)
+                    self.built[model] = (schema, node.get("config"))
+                    return model, reference
             except (KeyError, AttributeError, TypeError) as error:
                 # Only this walk's own lookups raise these; an author's code
                 # runs inside round_trip, which names its errors itself.
@@ -363,6 +375,12 @@ class Portable:
         """Admit a record and describe it once under ``$defs``."""
         cls = node["cls"]
         subject = f"record {path}"
+        hook = _class_hook(cls)
+        if hook is not None:
+            raise self.fail(
+                f"{subject} {hook}, which can change what is read from a value "
+                "of it or built as one; a record keeps Pydantic's own"
+            )
         admitted = {"cls", "schema", "config", "custom_init", "root_model"}
         if "post_init" in node and not (
             type(node["post_init"]) is str and node["post_init"] == "model_post_init"
@@ -461,18 +479,62 @@ class Portable:
             f"field {path}",
         )
         description = self.describe(node["schema"], path, ())
+        if "default" in node:
+            default = node["default"]
+            problem = _default_problem(default)
+            if problem is not None:
+                raise self.fail(
+                    f"field {path} has a default holding {problem}, which "
+                    "pydantic-core might not copy for each value read without "
+                    "the field; build it from plain lists, dicts and sets, "
+                    "immutable values and records that keep Pydantic's own "
+                    "methods"
+                )
+            # pydantic-core copies a default only when it cannot be hashed
+            # (src/validators/with_default.rs), so it hands a hashable one to
+            # every value read without the field as the same object. That is
+            # safe only for values that cannot change, and a record always
+            # can: freezing it leaves its private attributes and its set of
+            # fields given open.
+            if _hashable(default) and not _unchanging(default):
+                raise self.fail(
+                    f"field {path} has a default that every value read without "
+                    "the field would share, since it can be hashed, and that "
+                    "holds a record, which can change; give the field a "
+                    "default_factory that builds the record, such as a lambda"
+                )
         if "default_factory" in node:
             if node.get("default_factory_takes_data"):
                 raise self.fail(
                     f"field {path} has a default factory that takes the other fields"
                 )
+            factory = node["default_factory"]
             try:
-                made = node["default_factory"]()
+                # pydantic-core calls the factory once for each value read
+                # without the field, so two calls must build values that
+                # share nothing that can change.
+                made = factory()
+                again = factory()
             except Exception as error:  # the author's factory may raise anything
                 raise self.fail(
                     f"field {path} has a default factory that raised "
                     f"{type(error).__name__}: {error}"
                 ) from error
+            problem = _default_problem(made)
+            if problem is not None:
+                raise self.fail(
+                    f"field {path} has a default factory that builds a value "
+                    f"holding {problem}; build it from plain lists, dicts and "
+                    "sets, immutable values and records that keep Pydantic's "
+                    "own methods"
+                )
+            shared = _shared_between(made, again)
+            if shared is not None:
+                raise self.fail(
+                    f"field {path} has a default factory that returns the same "
+                    f"{shared} on every call, which every value read without "
+                    "the field would share; make it build a new one on each call"
+                )
             self.round_trip(node["schema"], made, path, description)
             return description, True
         return {
@@ -1104,6 +1166,168 @@ def _unchanged(held: object, written: object) -> bool:
     if type(written) is int and type(held) is float:
         return held == written
     return type(held) is type(written) and held == written
+
+
+# What pydantic-core reads from a record instance, or calls to build or copy
+# one, that a record class could otherwise replace: attribute lookup, instance
+# creation, the instance slots BaseModel declares, and the deep copy it makes
+# of a default it cannot hash (src/validators/with_default.rs).
+_RECORD_HOOKS = frozenset(
+    {
+        "__getattribute__",
+        "__getattr__",
+        "__new__",
+        "__dict__",
+        "__class__",
+        "__deepcopy__",
+        "__pydantic_extra__",
+        "__pydantic_fields_set__",
+        "__pydantic_private__",
+    }
+)
+
+
+def _class_hook(cls: type[Any]) -> str | None:
+    """Say how a record class replaces what Pydantic reads, or None.
+
+    Every class in its method resolution order but ``BaseModel`` and
+    ``object`` is read, so a mixin listed after ``BaseModel`` counts too. Each
+    namespace is read through ``type``'s own descriptors, as in
+    ``_from_classes``, so a metaclass cannot run code here.
+    """
+    if type(cls) is not type(BaseModel):
+        return f"has the metaclass {type(cls).__qualname__}, not Pydantic's"
+    for klass in type.__dict__["__mro__"].__get__(cls):
+        if klass is BaseModel or klass is object:
+            continue
+        for key in type.__dict__["__dict__"].__get__(klass):
+            if type(key) is not str:
+                return f"has a namespace key that is not text in {klass.__qualname__}"
+            if key in _RECORD_HOOKS:
+                where = "" if klass is cls else f" in {klass.__qualname__}"
+                return f"defines {key}{where}"
+    return None
+
+
+# Values pydantic-core may hand to every value read without the field, since
+# none of them can change: these exact types, and enum members.
+_IMMUTABLE = frozenset(
+    {str, int, float, bool, bytes, type(None), Decimal, date, datetime, time, timedelta}
+)
+
+
+def _default_problem(default: object) -> str | None:
+    """Name what in a default pydantic-core might not copy, or None.
+
+    pydantic-core deep-copies a default it cannot hash, and ``copy.deepcopy``
+    asks each object how to copy it, finding ``__deepcopy__`` on the instance
+    before its class. So a default holds only exact lists, dicts, sets,
+    tuples and frozensets, immutable scalars of exact types, enum members, and
+    records that keep Pydantic's own copy and hold nothing but their fields.
+    Anything else, such as a subclass of a list, is refused.
+    """
+    pending = [default]
+    seen: set[int] = set()
+    instance_dict = type.__dict__["__dict__"].__get__(BaseModel)["__dict__"]
+    while pending:
+        item = pending.pop()
+        kind = type(item)
+        if kind in _IMMUTABLE or issubclass(kind, enum.Enum):
+            continue
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        if issubclass(kind, BaseModel):
+            hook = _class_hook(kind)
+            if hook is not None:
+                return f"a {kind.__qualname__}, which {hook}"
+            fields = instance_dict.__get__(item)
+            extra = set(fields) - set(kind.__pydantic_fields__)
+            if extra:
+                return (
+                    f"a {kind.__qualname__} with values outside its fields: "
+                    f"{', '.join(sorted(map(repr, extra)))}"
+                )
+            pending.extend(fields.values())
+        elif kind in (list, tuple, set, frozenset):
+            pending.extend(cast("list[object]", item))
+        elif kind is dict:
+            pending.extend(cast("dict[object, object]", item).items())
+        else:
+            return f"a {kind.__qualname__}"
+    return None
+
+
+def _unchanging(value: object) -> bool:
+    """Whether nothing in a default can change: immutable scalars, enum
+    members, and tuples and frozensets of them. Never a record."""
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        kind = type(item)
+        if kind in _IMMUTABLE or issubclass(kind, enum.Enum):
+            continue
+        if kind in (tuple, frozenset):
+            pending.extend(cast("tuple[object, ...]", item))
+        else:
+            return False
+    return True
+
+
+def _changeable_parts(value: object) -> Iterator[object]:
+    """Every object reachable from a value that is not an immutable scalar or
+    an enum member, each once.
+
+    A record is walked through its fields, its private attributes and its
+    set of fields given, which Pydantic keeps beside them; tuples and
+    frozensets are walked through; any other object is yielded as it is.
+    """
+    pending = [value]
+    seen: set[int] = set()
+    slots = type.__dict__["__dict__"].__get__(BaseModel)
+    fields, private, given = (
+        slots["__dict__"],
+        slots["__pydantic_private__"],
+        slots["__pydantic_fields_set__"],
+    )
+    while pending:
+        item = pending.pop()
+        kind = type(item)
+        if kind in _IMMUTABLE or issubclass(kind, enum.Enum) or id(item) in seen:
+            continue
+        seen.add(id(item))
+        if kind in (tuple, frozenset):
+            pending.extend(cast("tuple[object, ...]", item))
+            continue
+        yield item
+        if issubclass(kind, BaseModel):
+            pending.extend(fields.__get__(item).values())
+            pending.append(given.__get__(item))
+            held = private.__get__(item)
+            if held is not None:
+                pending.append(held)
+        elif kind in (list, set):
+            pending.extend(cast("list[object]", item))
+        elif kind is dict:
+            pending.extend(cast("dict[object, object]", item).values())
+
+
+def _shared_between(first: object, second: object) -> str | None:
+    """Name an object two values can both reach that can change, or None."""
+    held = {id(part): part for part in _changeable_parts(first)}
+    for part in _changeable_parts(second):
+        if held.get(id(part)) is part:
+            return type(part).__qualname__
+    return None
+
+
+def _hashable(value: object) -> bool:
+    """Whether ``hash`` takes a value, as pydantic-core asks of a default."""
+    try:
+        hash(value)
+    except Exception:  # an author's __hash__ may raise anything
+        return False
+    return True
 
 
 def _from_classes(cls: type[Any], name: str) -> object:
