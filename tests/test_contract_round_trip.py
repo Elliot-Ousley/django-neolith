@@ -17,7 +17,7 @@ import itertools
 import json
 import types
 from collections.abc import Callable, Mapping
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Annotated, Any, Literal, Protocol, cast
 
@@ -35,11 +35,19 @@ from pydantic import (
     Field,
     Strict,
     StringConstraints,
-    TypeAdapter,
     create_model,
 )
 
-from neolith import Contract, ContractDefinitionError, action, contract
+from neolith import (
+    Binary,
+    Contract,
+    ContractDefinitionError,
+    Decimal128,
+    Duration,
+    action,
+    contract,
+)
+from neolith._forms import FORMS
 from neolith._portable import (
     portable_constructs,
     portable_scalars,
@@ -54,19 +62,8 @@ _HYPOTHESIS = settings(
     suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
 )
 
-_DURATION = TypeAdapter(timedelta)
-# Strategies for the formats the description uses that hypothesis-jsonschema
-# does not know; it generates "date" and "date-time" (RFC 3339, always with an
-# offset) itself. Durations are Pydantic's ISO 8601 text.
-_FORMATS: dict[str, st.SearchStrategy[str]] = {
-    "binary": st.text(),
-    "duration": st.timedeltas(
-        min_value=timedelta(days=-9999), max_value=timedelta(days=9999)
-    ).map(lambda value: _DURATION.dump_python(value, mode="json")),
-}
-
-# The formats the description uses that a JSON Schema validator checks. The
-# duration encoding is settled in step 3 (#10), so "duration" is left out.
+# The formats the description uses. Every other encoded form, such as bytes
+# or a decimal, is stated by a pattern, which every validator checks.
 _FORMAT_CHECKER = FormatChecker(formats=("date", "date-time"))
 
 _names = itertools.count()
@@ -105,6 +102,10 @@ _KEYS: dict[str, dict[str, st.SearchStrategy[object]]] = {
     "date": {},
     # Set by Pydantic on every timestamp and duration, not by authors.
     "timedelta": {"microseconds_precision": st.just("truncate")},
+    # neolith's own forms, which admit no constraint.
+    "Binary": {},
+    "Decimal128": {},
+    "Duration": {},
     "datetime": {
         "tz_constraint": st.just("aware"),
         "microseconds_precision": st.just("truncate"),
@@ -120,7 +121,11 @@ _TYPES_BY_KEY: dict[str, object] = {
     "date": date,
     "timedelta": timedelta,
     "datetime": AwareDatetime,
+    "Binary": Binary,
+    "Decimal128": Decimal128,
+    "Duration": Duration,
 }
+_FORM_KEYS = {"Binary", "Decimal128", "Duration"}
 _STRING_KEYS = {
     "strip_whitespace",
     "to_lower",
@@ -145,14 +150,27 @@ _SETTING_VALUES: dict[str, st.SearchStrategy[object]] = {
 # default that does not read back as itself, so every pick is fair game.
 _DEFAULTS: dict[str, list[object]] = {
     "bool": [False, True, 0],
-    "int": [0, 3, True, 3.0, None, "3"],
-    "float": [0.0, 1, 1.5, True],
+    "int": [0, 3, True, 3.0, None, "3", 2**53 - 1, 2**53],
+    "float": [0.0, 1, 1.5, True, -0.0, 2**53],
     "str": ["", "abc", "ABC", " a ", "\u00df"],
     "bytes": [b"", b"ok", b"\xff"],
-    "decimal": [Decimal("1.50"), 0, "2"],
+    "decimal": [Decimal("1.50"), 0, "2", Decimal("1E+2"), Decimal("-0")],
     "date": [date(2026, 1, 1), "2026-01-01"],
     "timedelta": [timedelta(seconds=90), 1.5],
-    "datetime": [datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 1)],
+    "datetime": [
+        datetime(2026, 1, 1, tzinfo=UTC),
+        datetime(2026, 1, 1),
+        datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=1))),
+    ],
+    "Binary": [b"", b"\xff", "_w==", "/w=="],
+    "Decimal128": [
+        Decimal("1.50"),
+        Decimal("1E+2"),
+        Decimal("-0"),
+        Decimal("1E-7"),
+        "2",
+    ],
+    "Duration": [timedelta(seconds=90), "1.500s", timedelta(seconds=10**11), 1.5],
 }
 
 
@@ -172,7 +190,8 @@ def _scalars(draw: st.DrawFn) -> tuple[object, list[object]]:
     markers: list[object] = []
     # Strict mode is refused, so it is drawn rarely. Hypothesis favours small
     # integers, so the rare value is one from the middle of the range.
-    if draw(st.integers(0, 19)) == 13:
+    # Pydantic itself refuses Strict() on neolith's forms.
+    if draw(st.integers(0, 19)) == 13 and kind not in _FORM_KEYS:
         markers.append(Strict())
     if kind == "str":
         markers.append(StringConstraints(**cast("Any", values)))
@@ -330,8 +349,10 @@ def test_generator_covers_the_allowlist() -> None:
     for kind, (_, bounds, other) in portable_scalars().items():
         assert set(bounds) | set(other) <= set(_KEYS[kind]), kind
     assert set(portable_settings()) <= set(_SETTING_VALUES)
-    # The generator also draws decimals, which the checker refuses.
+    # The generator also draws plain bytes, decimals and durations, which the
+    # checker refuses, and neolith's own forms.
     assert set(portable_scalars()) <= set(_KEYS)
+    assert {form.name for form in FORMS} <= set(_KEYS)
     drawn = {
         "list": set(_LENGTHS),
         "dict": set(_LENGTHS),
@@ -389,7 +410,7 @@ def _round_trip_with_defaults(
     _round_trip(record, schema, {k: v for k, v in value.items() if k in required})
 
 
-@pytest.mark.spec("CON-16")
+@pytest.mark.spec("CON-16", "CON-34")
 @_HYPOTHESIS
 @given(st.data())
 def test_generated_contracts_round_trip_through_their_description(
@@ -401,11 +422,11 @@ def test_generated_contracts_round_trip_through_their_description(
     except ContractDefinitionError:
         # Refused: the property is about contracts that are accepted.
         return
-    value = data.draw(from_schema(schema, custom_formats=_FORMATS))
+    value = data.draw(from_schema(schema))
     _round_trip_with_defaults(record, schema, value)
 
 
-@pytest.mark.spec("CON-16", "CON-24")
+@pytest.mark.spec("CON-16", "CON-24", "CON-34")
 @_HYPOTHESIS
 @given(st.data())
 def test_generated_detail_records_round_trip_through_their_description(
@@ -418,7 +439,7 @@ def test_generated_detail_records_round_trip_through_their_description(
         schema = _declare(record, role="detail")
     except ContractDefinitionError:
         return
-    value = data.draw(from_schema(schema, custom_formats=_FORMATS))
+    value = data.draw(from_schema(schema))
     _round_trip_with_defaults(record, schema, value)
 
 
@@ -433,16 +454,17 @@ class RefPart(BaseModel):
 
 
 class Reference(BaseModel):
-    """Every portable form, with defaults as authors write them."""
+    """Every admitted portable form, with defaults as authors write them."""
 
     flag: bool = False
     count: int = 0
     ratio: float = 1.0
     name: str = ""
-    raw: bytes = b""
+    raw: Binary = b"\xff"
+    amount: Decimal128 = Decimal("1.50")
+    span: Duration = timedelta(seconds=90)
     when: AwareDatetime
     day: date
-    span: timedelta = timedelta(seconds=90)
     parts: list[RefPart] = []
     totals: dict[str, int] = {}
     colour: RefColour = RefColour.RED
@@ -450,14 +472,14 @@ class Reference(BaseModel):
     note: str | None = None
 
 
-@pytest.mark.spec("CON-16")
+@pytest.mark.spec("CON-16", "CON-34")
 @_HYPOTHESIS
 @given(st.data())
 def test_reference_contract_round_trips_through_its_description(
     data: st.DataObject,
 ) -> None:
     schema = _declare(Reference)
-    value = data.draw(from_schema(schema, custom_formats=_FORMATS))
+    value = data.draw(from_schema(schema))
     _round_trip_with_defaults(Reference, schema, value)
 
 

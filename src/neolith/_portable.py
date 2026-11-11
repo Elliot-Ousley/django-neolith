@@ -9,7 +9,8 @@ or a default that does not survive a JSON round trip, is a
 ``ContractDefinitionError`` that names the contract, the action and the field
 (CON-17).
 
-The same walk writes the neutral description (CON-16). It never reads
+The same walk writes the neutral description (CON-16), with each form's wire
+encoding (ADR 0019) stated as a pattern or a range. It never reads
 Pydantic's JSON Schema generator. ``WithJsonSchema``, ``json_schema_extra``,
 ``__get_pydantic_json_schema__`` and similar hooks only change what that
 generator writes, so they cannot change the description. Records and enums
@@ -17,11 +18,14 @@ are described once each under ``$defs``, by class name; ``type`` aliases are
 written out where they are used.
 """
 
+import copy
 import json
 import math
 import re
+import sys
 import types
 from collections.abc import Iterator, Mapping
+from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr
@@ -32,9 +36,29 @@ from pydantic_core import (
     core_schema,
 )
 
+from neolith._forms import FORM_FOR_KIND, form_in, form_of
+
 # A record or enum name, as other languages' generated code will use it
 # (CON-20).
 _TYPE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+
+# The wire encodings of spec 01 (ADR 0019) that Pydantic's own types write.
+# Integers are those every JSON reader holds exactly; numbers are finite
+# doubles. Each pattern is ASCII-only and anchored with ^...$, and matches the
+# same strings under ECMA-262, Rust regex and Python's re.fullmatch. Durations,
+# decimals and bytes are neolith's own types (neolith._forms).
+SAFE_INTEGER_MAX = 2**53 - 1
+DOUBLE_MAX = sys.float_info.max
+_DATE = (
+    r"(000[1-9]|00[1-9][0-9]|0[1-9][0-9]{2}|[1-9][0-9]{3})"
+    r"-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])"
+)
+DATE_PATTERN = f"^{_DATE}$"
+TIMESTAMP_PATTERN = (
+    f"^{_DATE}"
+    r"T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\.[0-9]{1,6})?"
+    r"(Z|[+\-]([01][0-9]|2[0-3]):[0-5][0-9])$"
+)
 
 # Keys any node may carry without changing what travels: Pydantic's id for the
 # node, and metadata (read only by Pydantic's JSON Schema generator). Strict
@@ -69,10 +93,25 @@ _ENTRY_BOUNDS = {"min_length": "minProperties", "max_length": "maxProperties"}
 # constraint without a JSON Schema keyword of the same meaning, such as a
 # decimal's max_digits, is not admitted, so that the description states every
 # rule the provider enforces.
-_SCALARS: dict[str, tuple[dict[str, str], Mapping[str, str], frozenset[str]]] = {
+#
+# Each description states the form's wire encoding. A duration, a decimal and
+# bytes are not among them: Pydantic writes them otherwise, so they are
+# neolith's own types (neolith._forms), and the plain types are refused.
+_SCALARS: dict[str, tuple[dict[str, Any], Mapping[str, str], frozenset[str]]] = {
     "bool": ({"type": "boolean"}, {}, frozenset()),
-    "int": ({"type": "integer"}, _INTEGER_BOUNDS, frozenset()),
-    "float": ({"type": "number"}, _RANGE_BOUNDS, frozenset({"allow_inf_nan"})),
+    "int": (
+        {"type": "integer", "minimum": -SAFE_INTEGER_MAX, "maximum": SAFE_INTEGER_MAX},
+        _INTEGER_BOUNDS,
+        frozenset(),
+    ),
+    # Infinity and NaN are admitted on the way in, as Pydantic reads them by
+    # default; the description's range refuses them, and a sender does not
+    # send them (spec 01).
+    "float": (
+        {"type": "number", "minimum": -DOUBLE_MAX, "maximum": DOUBLE_MAX},
+        _RANGE_BOUNDS,
+        frozenset({"allow_inf_nan"}),
+    ),
     # strip_whitespace, to_lower and to_upper convert values on the way in;
     # they are refused next to a length (see Portable.transforms).
     "str": (
@@ -80,15 +119,13 @@ _SCALARS: dict[str, tuple[dict[str, str], Mapping[str, str], frozenset[str]]] = 
         _STRING_BOUNDS,
         frozenset({"strip_whitespace", "to_lower", "to_upper"}),
     ),
-    "bytes": ({"type": "string", "format": "binary"}, {}, frozenset()),
-    "date": ({"type": "string", "format": "date"}, {}, frozenset()),
-    "timedelta": (
-        {"type": "string", "format": "duration"},
+    "date": (
+        {"type": "string", "format": "date", "pattern": DATE_PATTERN},
         {},
-        frozenset({"microseconds_precision"}),
+        frozenset(),
     ),
     "datetime": (
-        {"type": "string", "format": "date-time"},
+        {"type": "string", "format": "date-time", "pattern": TIMESTAMP_PATTERN},
         {},
         frozenset({"tz_constraint", "microseconds_precision"}),
     ),
@@ -117,6 +154,11 @@ _UNCHECKED_VALIDATORS = frozenset({"function-after", "function-wrap"})
 _VALIDATOR_KEYS = frozenset({"function", "schema", "json_schema_input_schema"})
 # The keys under which a node holds the nodes that check parts of its value.
 _CHILDREN = ("schema", "items_schema", "keys_schema", "values_schema")
+# The keys of the nodes that only step to another node.
+_WRAPPER_KEYS = {
+    "definitions": frozenset({"schema", "definitions"}),
+    "definition-ref": frozenset({"schema_ref"}),
+}
 
 # Model settings that change validation only. Anything else that reaches the
 # core config, such as ser_json_timedelta or val_json_bytes, changes the wire.
@@ -134,6 +176,9 @@ _SETTINGS = frozenset(
         "str_to_upper",
     }
 )
+
+# The description of a map key: plain text, maybe with lengths, or a literal.
+_KEY_DESCRIPTION = frozenset({"type", "minLength", "maxLength", "enum"})
 
 # What an unadmitted key means, for the message.
 _KEY_MEANINGS = {
@@ -428,14 +473,22 @@ class Portable:
                     f"field {path} has a default factory that raised "
                     f"{type(error).__name__}: {error}"
                 ) from error
-            self.round_trip(node["schema"], made, path)
+            self.round_trip(node["schema"], made, path, description)
             return description, True
         return {
             **description,
-            "default": self.round_trip(node["schema"], node["default"], path),
+            "default": self.round_trip(
+                node["schema"], node["default"], path, description
+            ),
         }, True
 
-    def round_trip(self, schema: Mapping[str, Any], value: object, path: str) -> object:
+    def round_trip(
+        self,
+        schema: Mapping[str, Any],
+        value: object,
+        path: str,
+        description: Mapping[str, Any],
+    ) -> object:
         """Return a default's JSON form if it reads back as itself.
 
         Pydantic sends a default as written: it is not validated unless the
@@ -443,6 +496,8 @@ class Portable:
         So the default must already be in the form its type reads back,
         exactly, as JSON text: ``Decimal`` for a decimal, not ``0``, and
         ``1.0`` rather than ``1`` wherever ``1`` would not read back as ``1``.
+        What Pydantic writes must also be in its wire encoding, which
+        ``description`` states: ``0.0``, not ``-0.0``.
         """
         if self.definitions:
             schema = core_schema.definitions_schema(
@@ -483,9 +538,7 @@ class Portable:
         except (ValueError, TypeError) as error:
             raise self.fail(
                 f"field {path} has the default {shown(value)}, which cannot be written "
-                "as JSON: a string with a lone surrogate never can, and bytes "
-                "that are not UTF-8 need the base64 encoding that the in-process "
-                "transport settles"
+                "as JSON: a string with a lone surrogate never can"
             ) from error
         written: object = None
         problem: str | None
@@ -493,14 +546,20 @@ class Portable:
             written = json.loads(sent)
         except ValueError:
             # The json module refuses an integer of more than 4300 digits
-            # (sys.set_int_max_str_digits), far outside the 64-bit range.
-            problem = "it holds an integer outside the 64-bit range"
+            # (sys.set_int_max_str_digits), far outside the integer range.
+            problem = f"it holds an integer outside ±{SAFE_INTEGER_MAX}"
         else:
             problem = json_value_problem(written)
         if problem is not None:
             raise self.fail(
                 f"field {path} has the default {shown(value)}, which travels as a "
                 f"JSON value outside the portable forms: {problem}"
+            )
+        problem = encoding_problem(description, self.defs, written)
+        if problem is not None:
+            raise self.fail(
+                f"field {path} has the default {shown(value)}, which Pydantic "
+                f"writes outside its wire encoding: {problem}"
             )
         try:
             read_value = validator.validate_json(sent)
@@ -537,6 +596,7 @@ class Portable:
         """
         kind = node.get("type")
         subject = f"field {path}"
+        self.decorated(node, subject, path)
         if kind == "definitions":
             self.keys(node, frozenset({"schema", "definitions"}), subject)
             return self.describe(node["schema"], path, aliases)
@@ -559,6 +619,20 @@ class Portable:
             return self.record(node, path)
         if kind == "enum":
             return self.enum(node, path)
+        # Judged without the keys any node may carry (_ANY_NODE), such as the
+        # reference Pydantic adds to a type alias.
+        form = form_of(
+            {key: value for key, value in node.items() if key not in _ANY_NODE}
+            | {"type": kind}
+        )
+        if form is not None:
+            return form.description()
+        if kind in FORM_FOR_KIND:
+            named = FORM_FOR_KIND[kind]
+            raise self.fail(
+                f"{subject} is a plain {named.python_type.__name__}, which Pydantic "
+                f"does not write in its wire form; declare it as neolith.{named.name}"
+            )
         if kind in _SCALARS:
             base, bounds, other = _SCALARS[kind]
             self.keys(node, frozenset(bounds) | other, subject)
@@ -587,7 +661,7 @@ class Portable:
                     f"{subject} is a timestamp, which carries an offset from UTC "
                     "(RFC 3339); annotate it as pydantic.AwareDatetime"
                 )
-            return {**base, **self.bounds(node, path, bounds)}
+            return _narrowed(base, self.bounds(node, path, bounds))
         if kind == "list":
             self.keys(
                 node, frozenset({"items_schema"}) | frozenset(_ITEM_BOUNDS), subject
@@ -623,7 +697,10 @@ class Portable:
                     "map keys are not converted in this version"
                 )
             key = self.describe(node["keys_schema"], f"{path} key", aliases)
-            if key.get("type") != "string" or "format" in key:
+            # A map's keys are strings (map<string, T>): plain text, maybe
+            # with lengths, or a literal. A key of another form, such as a
+            # date or a duration, is refused.
+            if key.get("type") != "string" or not set(key) <= _KEY_DESCRIPTION:
                 raise self.fail(
                     f"{subject} is a map whose keys are not strings, "
                     "which is not a portable form"
@@ -653,18 +730,6 @@ class Portable:
             raise self.fail(
                 f"{subject} is a literal of values other than strings, "
                 "which is not a portable form"
-            )
-        if kind == "decimal":
-            # Pydantic writes a decimal as str(Decimal) and reads one through
-            # Python's Decimal, which refuses an exponent whose limit depends
-            # on the coefficient's length, so no pattern states the accepted
-            # forms exactly, and "format": "decimal" is not one that readers
-            # in other languages know.
-            raise self.fail(
-                f"{subject} is a decimal, which this version does not admit: no "
-                "JSON Schema rule states exactly the forms Pydantic writes and "
-                "reads; the decimal encoding is settled with the in-process "
-                "transport"
             )
         raise self.fail(f"{subject} has type {kind}, which is not a portable form")
 
@@ -726,6 +791,71 @@ class Portable:
                 child = current.get(key)
                 if isinstance(child, dict):
                     pending.append(child)
+
+    def decorated(self, node: Mapping[str, Any], subject: str, path: str) -> None:
+        """Refuse a neolith type with anything added to it, naming the type.
+
+        Pydantic applies a constraint such as ``max_length`` in an after
+        validator around the type's node, or a chain after it, and a plain
+        validator or a serializer replaces part of the node. Only type aliases
+        and before validators in front of the type's own node are admitted;
+        anything else is refused here, so the message names the type instead
+        of a validator or node kind the author never wrote.
+        """
+        changed = False
+        seen: set[int] = set()
+        current = node
+        steps = _VALIDATORS | _UNCHECKED_VALIDATORS | set(_WRAPPER_KEYS) | {"chain"}
+        while current.get("type") in steps and id(current) not in seen:
+            seen.add(id(current))
+            kind = current.get("type")
+            # A serializer behind a type alias sits on the reference itself.
+            admitted = _WRAPPER_KEYS.get(str(kind), _VALIDATOR_KEYS) | _ANY_NODE
+            changed = (
+                changed
+                or kind in _UNCHECKED_VALIDATORS | {"chain"}
+                or not set(current) <= admitted
+            )
+            if kind == "definition-ref":
+                current = self.definitions.get(str(current.get("schema_ref")), {})
+            elif kind == "chain":
+                # Pydantic chains a constraint it cannot apply in place, such
+                # as a pattern, after the type's own node.
+                chained = current.get("steps") or [{}]
+                current = chained[0] if isinstance(chained[0], Mapping) else {}
+            else:
+                current = current.get("schema", {})
+        form = form_in(current)
+        serialization = current.get("serialization")
+        if form is None and isinstance(serialization, Mapping):
+            # A plain validator over a type alias keeps the alias's serializer
+            # by wrapping a reference to it.
+            form, changed = form_in(self.unwrapped(serialization.get("schema"))), True
+        if form is None:
+            return
+        bare = {key: value for key, value in current.items() if key not in _ANY_NODE}
+        if changed or form_of(bare | {"type": "function-plain"}) is None:
+            raise self.fail(
+                f"{subject} adds a constraint, a validator or a serializer to "
+                f"neolith.{form.name}; only a before validator is admitted there, "
+                "since the type's own reader and writer fix its form"
+            )
+
+    def unwrapped(self, node: object) -> Mapping[str, Any]:
+        """The node behind any ``definitions`` wrappers and references, or {}."""
+        seen: set[int] = set()
+        while (
+            isinstance(node, Mapping)
+            and node.get("type") in _WRAPPER_KEYS
+            and id(node) not in seen
+        ):
+            seen.add(id(node))
+            node = (
+                self.definitions.get(str(node.get("schema_ref")), {})
+                if node.get("type") == "definition-ref"
+                else node.get("schema", {})
+            )
+        return node if isinstance(node, Mapping) else {}
 
     def validator(self, node: Mapping[str, Any], subject: str, path: str = "") -> None:
         """Admit a before validator on a type without records; refuse the rest."""
@@ -813,11 +943,9 @@ def portable_settings() -> frozenset[str]:
     return _SETTINGS
 
 
-# The portable integer is 64-bit (spec 01, the portable type system).
-_INT64 = range(-(2**63), 2**63)
-# Spec 01, CON-30: the integers of an untyped detail, those every JSON reader
-# holds exactly (I-JSON, RFC 7493, section 2.2).
-SAFE_INTEGERS = range(-(2**53 - 1), 2**53)
+# The portable integers (spec 01), and those of an untyped detail (CON-30):
+# the ones every JSON reader holds exactly (I-JSON, RFC 7493, section 2.2).
+SAFE_INTEGERS = range(-SAFE_INTEGER_MAX, SAFE_INTEGER_MAX + 1)
 # JSON's scalars, as the json module reads them. bool is a subclass of int,
 # so each is matched by exact type, never with isinstance.
 _JSON_SCALARS = frozenset({str, int, float, bool, type(None)})
@@ -850,18 +978,15 @@ def text_problem(text: str) -> str | None:
     return None
 
 
-def json_value_problem(
-    value: object, max_depth: int | None = None, integers: range = _INT64
-) -> str | None:
+def json_value_problem(value: object, max_depth: int | None = None) -> str | None:
     """Say why ``value`` is not a portable JSON value, or return None.
 
     Admitted: ``dict`` with ``str`` keys, ``list``, ``str`` without a lone
-    surrogate, ``int`` in ``integers`` (64 bits unless given), finite
-    ``float``, ``bool`` and ``None``,
-    each by exact type. With ``max_depth``, maps and lists nest at most that
-    many levels, the outermost being the first. Walks without recursion, so a
-    deep value cannot exhaust the stack, and refuses a value that contains
-    itself.
+    surrogate, ``int`` within ±(2**53 - 1), finite ``float``, ``bool`` and
+    ``None``, each by exact type. With ``max_depth``, maps and lists nest at
+    most that many levels, the outermost being the first. Walks without
+    recursion, so a deep value cannot exhaust the stack, and refuses a value
+    that contains itself.
     """
     pending: list[tuple[object, int, bool]] = [(value, 1, False)]
     open_containers: set[int] = set()
@@ -876,9 +1001,8 @@ def json_value_problem(
                 problem = text_problem(cast(str, item))
                 if problem is not None:
                     return problem
-            elif kind is int and item not in integers:
-                bound = "64-bit" if integers == _INT64 else f"±{integers.stop - 1}"
-                return f"it holds {shown(item)}, outside the {bound} integer range"
+            elif kind is int and item not in SAFE_INTEGERS:
+                return f"it holds {shown(item)}, outside ±{SAFE_INTEGER_MAX}"
             elif kind is float and not math.isfinite(cast(float, item)):
                 return f"{shown(item)} is not a JSON number"
             continue
@@ -900,6 +1024,62 @@ def json_value_problem(
             if problem is not None:
                 return problem
             pending.append((child, depth + 1, False))
+    return None
+
+
+def encoding_problem(
+    description: Mapping[str, Any], defs: Mapping[str, Any], value: object
+) -> str | None:
+    """Say which wire-encoding rule of spec 01 a JSON value breaks, or None.
+
+    ``value`` is what Pydantic wrote for a value of the described type, read
+    back with the json module, and ``defs`` holds the records and enums that
+    ``description`` refers to. Only the encoding rules are checked: each
+    string against its form's patterns, matched over the whole string; a
+    number's zero, written without its sign; and a timestamp's instant, in
+    years 0001 to 9999 in UTC. Integers and the field's own constraints are
+    checked elsewhere.
+    """
+    pending: list[tuple[Mapping[str, Any], object]] = [(description, value)]
+    while pending:
+        schema, item = pending.pop()
+        ref = schema.get("$ref")
+        if isinstance(ref, str):
+            pending.append((defs.get(ref.rsplit("/", 1)[-1], {}), item))
+            continue
+        if "anyOf" in schema:
+            if item is not None:
+                pending.extend(
+                    (branch, item)
+                    for branch in schema["anyOf"]
+                    if branch.get("type") != "null"
+                )
+            continue
+        if type(item) is dict:
+            properties = schema.get("properties", {})
+            others = schema.get("additionalProperties", {})
+            pending.extend(
+                (properties.get(key, others), child)
+                for key, child in cast(dict[str, Any], item).items()
+            )
+        elif type(item) is list:
+            items = schema.get("items", {})
+            pending.extend((items, child) for child in item)
+        elif type(item) is str:
+            patterns = [schema.get("pattern")]
+            patterns += [part.get("pattern") for part in schema.get("allOf", [])]
+            for pattern in patterns:
+                if pattern is not None and not re.fullmatch(pattern, item):
+                    return f"{shown(item)} does not match {pattern}"
+            if schema.get("format") == "date-time":
+                try:
+                    datetime.fromisoformat(item).astimezone(UTC)
+                except OverflowError:
+                    return f"{shown(item)} is outside years 0001 to 9999 in UTC"
+                except ValueError:
+                    return f"{shown(item)} is not a timestamp"
+        elif type(item) is float and item == 0 and math.copysign(1.0, item) < 0:
+            return "-0.0 travels as 0; write 0.0"
     return None
 
 
@@ -1024,6 +1204,20 @@ def _only_initialises_private_attributes(cls: type[Any]) -> bool:
             return False
         function = held[_WRAPPED_CELL]
     return False
+
+
+def _narrowed(base: Mapping[str, Any], bounds: Mapping[str, Any]) -> dict[str, Any]:
+    """A form's description with a field's own bounds, the narrower one kept.
+
+    The form's range (an integer's or a number's) and a field's bound of the
+    same kind cannot both be written under one keyword, so the tighter one is.
+    """
+    narrowed = {**copy.deepcopy(dict(base)), **bounds}
+    if "minimum" in base and "minimum" in bounds:
+        narrowed["minimum"] = max(base["minimum"], bounds["minimum"])
+    if "maximum" in base and "maximum" in bounds:
+        narrowed["maximum"] = min(base["maximum"], bounds["maximum"])
+    return narrowed
 
 
 def _bounds(node: Mapping[str, Any], keywords: Mapping[str, str]) -> dict[str, Any]:
