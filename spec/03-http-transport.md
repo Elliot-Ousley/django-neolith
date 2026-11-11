@@ -34,6 +34,7 @@ Errors are carried as a JSON body with a fixed shape and an HTTP status that fol
 | Kind | Status |
 |---|---|
 | `invalid_argument` | 400 |
+| `unauthenticated` | 401 |
 | `permission_denied` | 403 |
 | `not_found` | 404 |
 | `conflict` | 409 |
@@ -42,9 +43,11 @@ Errors are carried as a JSON body with a fixed shape and an HTTP status that fol
 | `internal` | 500 |
 | declared kinds | 422 |
 
-Body: `{"kind": "<kind>", "message": "<text>", "detail": {<typed detail record>}}`.
+Body: `{"kind": "<kind>", "message": "<text>", "data": {<typed detail record>}}`, with `data` present only for a declared kind. A response carries a *neolith error body* when its body is a JSON object whose `kind` is a string. The member for the detail record is named `data`, not `detail`, which RFC 9457 and some web frameworks use for a human-readable explanation.
 
-A connector takes the kind from the body only, never from the status. A non-success response without a neolith error body maps to `unavailable`. Examples are a 404 from a host that does not serve that contract version, or an error page from a proxy. A success response whose body is not a valid reply maps to `internal`.
+A *contract path* is the path of an action of a contract version the host provides. A response on any other path carries no neolith error body. The provider's host answers every failure on a contract path with a neolith error body and the status of its kind, including a request that fails validation and a failure of the host itself ([ADR 0008](../docs/adr/0008-typed-contract-errors-in-both-modes.md)). A 401 also carries a `Bearer` challenge in `WWW-Authenticate` (RFC 6750, section 3), since RFC 9110, section 15.5.2, requires a challenge with that status.
+
+A connector takes the kind from the body only, never from the status. A non-success response without a neolith error body maps to `unavailable`. Examples are a 404 from a host that does not provide that contract version, which is not a contract path, or an error page from a proxy. A success response whose body is not a valid reply, and a neolith error body that does not validate against the contract, map to `internal`, apart from an error of a kind the caller does not know.
 
 ## Projection
 

@@ -1,6 +1,6 @@
 # 01. Contracts
 
-**Status:** draft. Identity, actions, the portable type system, publication and checking are specified. Errors stay an outline until [ADR 0008](../docs/adr/0008-typed-contract-errors-in-both-modes.md) is decided.
+**Status:** draft. Identity, actions, the portable type system, publication and checking are specified. Errors are an outline of [ADR 0008](../docs/adr/0008-typed-contract-errors-in-both-modes.md). They become requirements, with their tests, in roadmap steps 2 to 5 (#9 to #12).
 
 ## Identity and versioning
 
@@ -68,13 +68,23 @@ Every action's error set includes the standard kinds, whether declared or not:
 |---|---|---|
 | `invalid_argument` | The request failed validation | no |
 | `not_found` | A referenced entity does not exist | no |
-| `permission_denied` | The principal may not perform the action | no |
+| `unauthenticated` | The call's credentials are missing or could not be verified, so the caller cannot be identified | no |
+| `permission_denied` | The caller, or the principal it calls for, may not perform the action | no |
 | `conflict` | The action conflicts with current state | no |
 | `unavailable` | No provider could be reached | yes, if idempotent |
-| `timeout` | The provider did not reply in time | yes, if idempotent |
-| `internal` | The provider failed | no |
+| `timeout` | The deadline passed before the call ended; the action might or might not have run | yes, if idempotent |
+| `internal` | The provider failed, or its reply or error could not be read | no |
 
 **CON-8.** A contract MAY declare additional error kinds per action, each with a typed detail record. Error kinds are part of the contract and follow its compatibility rules.
+
+In outline:
+
+- An error that crosses a contract carries its kind and a message and, for a declared kind, its detail record.
+- Only hosts and transports produce `unavailable` and `timeout`. A provider's action produces any other standard kind, or a kind the action declares.
+- A failure of a provider's action that is not an error of its error set, an `unavailable` or `timeout` that the action produces, and a failure of the provider's host itself reach the caller as `internal`. A signal to stop, such as cancellation or the process exiting, is not a failure of the action and is not converted. The `internal` error's message is fixed text with the trace identifier, and nothing of the original failure crosses. The provider's host records the original with the trace identifier.
+- An error that a provider's action receives from one of its own outgoing calls, and lets end the action, reaches its caller as `internal`. Passing a nested error on takes a new error produced by the action.
+- A caller whose version of the contract does not know a kind receives an error with that kind, and with its detail as an untyped value.
+- A mistake in the calling code, such as a call to an action the contract does not have, is not a contract error.
 
 Decision record: [0008](../docs/adr/0008-typed-contract-errors-in-both-modes.md).
 
