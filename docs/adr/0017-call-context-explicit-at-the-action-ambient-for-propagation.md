@@ -10,7 +10,7 @@ Every call carries a **call context**, separate from the request. The draft spec
 - **Propagated fields** pass from a call to the calls it makes: the principal on whose behalf the call is made, the trace identifier and the deadline.
 - **Per-call fields** belong to one outbound call: the idempotency key. Each outbound call gets a fresh key, kept only across retries of that same call.
 
-Over HTTP the context travels in headers (`Authorization`, `traceparent`, `Neolith-Timeout`, `Idempotency-Key`). The deadline crosses as a relative budget, and the receiving host computes its own local deadline from it (spec 03). Apps must not put it inside request types. The question, recorded as open question 6, is how it reaches the code that implements an action, and how it reaches the calls that code makes in turn.
+Over HTTP the context travels in headers (`Authorization`, `Neolith-Principal`, `traceparent`, `Neolith-Timeout`, `Idempotency-Key`). The deadline crosses as a relative budget, and the receiving host computes its own local deadline from it (spec 03). Apps must not put it inside request types. The question, recorded as open question 6, is how it reaches the code that implements an action, and how it reaches the calls that code makes in turn.
 
 Two directions have to work, and they pull different ways:
 
@@ -39,7 +39,7 @@ class InventoryImpl:
     def reserve(self, request: ReserveRequest, ctx: CallContext) -> ReserveReply:
         if ctx.principal is None:
             raise ContractError(kind="permission_denied", message="reserving needs a principal")
-        owner = ctx.principal.id
+        owner = (ctx.principal.issuer, ctx.principal.subject)
         quote = connect("pricing.v1").quote(QuoteRequest(sku=request.sku), context=ctx)
         ...
 ```
@@ -60,7 +60,7 @@ from neolith import current_context
 @Inventory.implement
 class InventoryImpl:
     def reserve(self, request: ReserveRequest) -> ReserveReply:
-        owner = current_context().principal.id   # raises outside a call
+        owner = (current_context().principal.issuer, current_context().principal.subject)   # raises outside a call
         quote = connect("pricing.v1").quote(QuoteRequest(sku=request.sku))  # inherits automatically
         ...
 ```
@@ -81,7 +81,7 @@ The transport sets a `contextvars.ContextVar` for the duration of the action and
 @Inventory.implement
 class InventoryImpl:
     def reserve(self, call: Call[ReserveRequest]) -> ReserveReply:
-        owner = call.principal.id
+        owner = (call.principal.issuer, call.principal.subject)
         sku = call.request.sku
         quote = connect("pricing.v1").quote(QuoteRequest(sku=sku), parent=call)
         ...
@@ -105,7 +105,7 @@ class InventoryImpl:
     def reserve(self, request: ReserveRequest, ctx: CallContext) -> ReserveReply:
         if ctx.principal is None:
             raise ContractError(kind="permission_denied", message="reserving needs a principal")
-        owner = ctx.principal.id
+        owner = (ctx.principal.issuer, ctx.principal.subject)
         quote = connect("pricing.v1").quote(QuoteRequest(sku=request.sku))  # child context derived by the host
         ...
 
@@ -201,14 +201,13 @@ Follows principles 5 (*same semantics over same mechanics*), 6 (*visible failure
 - The specification needs:
   - the derivation rules for a child context (propagated fields: deadline, trace, principal; per-call fields: the caller and the idempotency key, with the key derivation of Decision 3);
   - a canonical serialized form of a request, so that every implementation hashes it the same way (for example [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785), the JSON Canonicalization Scheme);
-  - a header for the asserted principal, and `Authorization` redefined in spec 03 as authenticating the calling app;
   - in the app declaration (spec 05), for each contract the app provides, the list of calling apps that may assert a principal;
   - the list of places a root context may be created, how a request root's app and principal are found, and when a request root opens and closes;
-  - that the principal is optional, and that the asserted-principal header is omitted when it is absent.
+  - that the principal is optional.
 - One path closes a request root late on Django 5.2's ASGI handler: a streaming response with status 400 or above whose client disconnects while Django logs the response, before the body is sent. The server then gives the host no signal that the response is done, and the root closes only when the host detects it, at the next cyclic garbage collection that reaches the body wrapper, with no fixed bound; in a long-running worker that can be minutes. The body never runs, but an executor that inherited the root can still call through it until then, and each such call is bounded only by its own deadline (spec 02). The documentation warns about this window.
-- 0010 backends declare which request inputs they read to resolve a principal, so that the host can vary responses on them (Decision 4, Cost). The specification and 0010 need that declaration.
+- 0010 backends declare which request inputs they read to resolve a principal, so that the host can vary responses on them (Decision 4, Cost). 0010 records this; the specification still needs it.
 - Apps that call each other on behalf of users list each other in their declarations. The roadmap's 0.1 skeleton, where two apps call each other, includes those entries. This is intended least privilege, not a workaround: delegation is granted per contract, not implied by being able to reach it.
-- Trust cost of Decision 6: a calling app that a provider lists can assert any principal to it. With the v0.1 shared-secret backend, anyone holding the secret can also claim to be any app, which is why 0010 already says that backend is for development only. A production backend narrows this with per-app credentials or signed delegation tokens.
+- Trust cost of Decision 6: a calling app that a provider lists can assert any principal to it. With the v0.1 shared-secret backend, anyone holding a calling app's secret, which every provider it calls holds, can also claim to be that app, which is why 0010 says that backend is for development only. A production backend narrows this with per-app credentials or signed delegation tokens.
 - Left for later records or the specification:
   - **A host-side idempotency record**, so that a retried parent does not run a non-idempotent child twice. It must say which actions it covers, what it stores (the key, the request hash, and the reply or error), how long it keeps an entry, a distinct error for a key reused with a different request, separate from `conflict`, which spec 01 reserves for a clash with current state, and that stored keys are scoped per caller and principal. Derived keys are predictable from the parent key, which the upstream caller chooses, so an unscoped record would let a caller replay another chain's key and be answered from its stored reply. Stripe's idempotent requests and the IETF draft below are the models. This is [open question 7](../open-questions.md).
   - **Calling under a different principal**, for example as the calling app's own principal. Not decided here.
