@@ -16,6 +16,7 @@ from decimal import Decimal
 from typing import (
     Annotated,
     Any,
+    ClassVar,
     Literal,
     Optional,
     Protocol,
@@ -1859,6 +1860,10 @@ class InheritsPrivate(WithPrivate):
     y: int = 0
 
 
+class InheritsPrivateTwice(InheritsPrivate):
+    z: int = 0
+
+
 class OwnPostInit(BaseModel):
     x: int
     _cache: int = PrivateAttr(0)
@@ -1867,17 +1872,199 @@ class OwnPostInit(BaseModel):
         self.x = 2
 
 
+class InheritsOwnPostInit(OwnPostInit):
+    y: int = 0
+
+
+def wrapped_model_post_init(self: BaseModel, context: object, /) -> None:
+    """An author's model_post_init, under the name of Pydantic's wrapper."""
+    object.__setattr__(self, "x", 2)
+
+
+setattr(wrapped_model_post_init, "__wrapped__", WithPrivate.model_post_init)  # noqa: B010
+
+
+class NamedLikePydantics(BaseModel):
+    x: int
+    _cache: int = PrivateAttr(0)
+
+    model_post_init = wrapped_model_post_init
+
+
+class Retargeted(OwnPostInit):
+    pass
+
+
+# Pydantic's wrapper now says it wraps Pydantic's own function; it still runs
+# the author's.
+setattr(Retargeted.model_post_init, "__wrapped__", WithPrivate.model_post_init)  # noqa: B010
+
+
+class PostInitObject:
+    """A callable with the code of Pydantic's wrapper, whose __wrapped__ raises."""
+
+    __code__ = InheritsPrivate.model_post_init.__code__
+
+    @property
+    def __wrapped__(self) -> object:
+        raise RuntimeError("__wrapped__ was read")
+
+    def __call__(self, context: object, /) -> None:
+        pass
+
+
+class ObjectPostInit(BaseModel):
+    x: int
+
+    model_post_init: ClassVar[Any] = PostInitObject()
+
+
+class PrivateObjectPostInit(ObjectPostInit):
+    _cache: int = PrivateAttr(0)
+
+
+def _forged(globals_: dict[str, Any], held: object) -> types.FunctionType:
+    """A function with the code of Pydantic's wrapper."""
+    wrapper = InheritsPrivate.model_post_init
+    return types.FunctionType(
+        wrapper.__code__, globals_, None, None, (types.CellType(held),)
+    )
+
+
+class ForgedClosure(BaseModel):
+    x: int
+    _cache: int = PrivateAttr(0)
+
+    # Pydantic's wrapper code and globals, holding the author's function.
+    model_post_init = _forged(
+        InheritsPrivate.model_post_init.__globals__, wrapped_model_post_init
+    )
+
+
+class ForgedGlobals(BaseModel):
+    x: int
+    _cache: int = PrivateAttr(0)
+
+    # Holding Pydantic's function, but calling the author's first.
+    model_post_init = _forged(
+        {
+            **InheritsPrivate.model_post_init.__globals__,
+            "init_private_attributes": wrapped_model_post_init,
+        },
+        WithPrivate.model_post_init,
+    )
+
+
+class HidesNamespace(type(BaseModel)):  # type: ignore[misc]
+    """A metaclass whose __dict__ is a property, which getattr_static skips."""
+
+    @property
+    def __dict__(cls) -> Mapping[str, Any]:  # type: ignore[override]
+        return cast("Mapping[str, Any]", type.__dict__["__dict__"].__get__(cls))
+
+
+class PostInitBehindMetaclass(InheritsPrivate, metaclass=HidesNamespace):
+    def model_post_init(self, context: object, /) -> None:
+        self.x = 2
+
+
+class UnhashableMeta(type):
+    def __hash__(cls) -> int:
+        raise RuntimeError("hashed")
+
+
+class UnhashableMetaclass(type(BaseModel), metaclass=UnhashableMeta):  # type: ignore[misc]
+    pass
+
+
+class PrivateUnderUnhashableMetaclass(WithPrivate, metaclass=UnhashableMetaclass):
+    pass
+
+
+class NamespaceKey(str):
+    """A key equal to nothing, which raises when compared once switched on."""
+
+    raising = False
+    __hash__ = str.__hash__
+
+    def __eq__(self, other: object) -> bool:
+        if NamespaceKey.raising:
+            raise RuntimeError("compared")
+        return False
+
+
+class OddNamespaceKey(WithPrivate):
+    # Looking up "model_post_init" in this namespace now compares this key.
+    locals()[NamespaceKey("model_post_init")] = WithPrivate.model_post_init
+
+    def model_post_init(self, context: object, /) -> None:
+        self.x = 2
+
+
+NamespaceKey.raising = True
+
+
+class RenamedPostInit(BaseModel):
+    x: int
+    _cache: int = PrivateAttr(0)
+
+    def other_hook(self, context: object, /) -> None:
+        self.x = 2
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, source: type[BaseModel], handler: GetCoreSchemaHandler
+    ) -> CoreSchema:
+        schema = handler(source)
+        cast("dict[str, Any]", schema)["post_init"] = "other_hook"
+        return schema
+
+
 @pytest.mark.spec("CON-13", "CON-16")
-@pytest.mark.parametrize("record", [WithPrivate, WithPlainPrivate, InheritsPrivate])
+@pytest.mark.parametrize(
+    "record",
+    [
+        WithPrivate,
+        WithPlainPrivate,
+        InheritsPrivate,
+        InheritsPrivateTwice,
+        PrivateUnderUnhashableMetaclass,
+    ],
+)
 def test_private_attributes_are_accepted(record: type[BaseModel]) -> None:
+    # Pydantic generated a model_post_init, so the record's post_init was checked.
+    assert record.model_post_init is not BaseModel.model_post_init
     described = Contract.of(declare_with_field(record)).describe()
     assert "_cache" not in described["$defs"][record.__name__]["properties"]
 
 
 @pytest.mark.spec("CON-13", "CON-17")
-def test_own_model_post_init_is_refused() -> None:
+@pytest.mark.parametrize(
+    "record",
+    [
+        OwnPostInit,
+        InheritsOwnPostInit,
+        NamedLikePydantics,
+        Retargeted,
+        ObjectPostInit,
+        PrivateObjectPostInit,
+        ForgedClosure,
+        ForgedGlobals,
+        PostInitBehindMetaclass,
+        OddNamespaceKey,
+    ],
+)
+def test_own_model_post_init_is_refused(record: type[BaseModel]) -> None:
     with pytest.raises(ContractDefinitionError, match="defines model_post_init"):
-        declare_with_field(OwnPostInit)
+        declare_with_field(record)
+
+
+@pytest.mark.spec("CON-13", "CON-17")
+def test_post_init_under_another_name_is_refused() -> None:
+    with pytest.raises(
+        ContractDefinitionError, match="runs a post-init other than model_post_init"
+    ):
+        declare_with_field(RenamedPostInit)
 
 
 # Unknown fields

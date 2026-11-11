@@ -20,11 +20,11 @@ written out where they are used.
 import json
 import math
 import re
+import types
 from collections.abc import Iterator, Mapping
 from typing import Any, Literal, cast
 
-from pydantic import BaseModel
-from pydantic._internal._model_construction import init_private_attributes
+from pydantic import BaseModel, ConfigDict, PrivateAttr
 from pydantic.errors import PydanticUndefinedAnnotation, PydanticUserError
 from pydantic_core import (
     SchemaSerializer,
@@ -319,6 +319,13 @@ class Portable:
         cls = node["cls"]
         subject = f"record {path}"
         admitted = {"cls", "schema", "config", "custom_init", "root_model"}
+        if "post_init" in node and not (
+            type(node["post_init"]) is str and node["post_init"] == "model_post_init"
+        ):
+            raise self.fail(
+                f"{subject} runs a post-init other than model_post_init, which "
+                "can change values after validation"
+            )
         if _only_initialises_private_attributes(cls):
             # Private attributes never travel; Pydantic sets post_init to
             # initialise them when the record has any.
@@ -919,27 +926,103 @@ def _unchanged(held: object, written: object) -> bool:
     return type(held) is type(written) and held == written
 
 
+def _from_classes(cls: type[Any], name: str) -> object:
+    """What an instance of ``cls`` finds for ``name`` in its classes, or None.
+
+    The method resolution order and each class's namespace are read through
+    ``type``'s own descriptors, as an instance lookup reads them, so a
+    metaclass can neither run code here nor hide an entry. A namespace key
+    that is not exactly a str could compare equal to ``name`` by code of its
+    own, so it gives None.
+    """
+    for klass in type.__dict__["__mro__"].__get__(cls):
+        found: list[object] = []
+        for key, value in type.__dict__["__dict__"].__get__(klass).items():
+            if type(key) is not str:
+                return None
+            if key == name:
+                found.append(value)
+        if found:
+            return found[0]
+    return None
+
+
+def _closure(function: object) -> list[object]:
+    """What a function's closure cells hold (None for an empty one)."""
+    if type(function) is not types.FunctionType:
+        return []
+    held: list[object] = []
+    for cell in function.__closure__ or ():
+        try:
+            held.append(cell.cell_contents)
+        except ValueError:
+            held.append(None)
+    return held
+
+
+class _Private(BaseModel):
+    # Nothing validates with these records, so no schema is built for them and
+    # no Pydantic plugin is called when neolith is imported.
+    model_config = ConfigDict(defer_build=True)
+
+    _x: int = PrivateAttr(0)
+
+
+def _post_init(self: BaseModel, context: object, /) -> None:
+    """Stands for an author's model_post_init, which Pydantic wraps."""
+
+
+class _Wrapped(_Private):
+    model_post_init = _post_init
+
+
+# Pydantic's own model_post_init for a record with private attributes, and the
+# wrapper it puts around an existing one, with the closure cell that holds the
+# function it wraps. They are taken from records built here, not imported from
+# pydantic._internal, whose names a minor release may change.
+_INIT_PRIVATE_ATTRIBUTES = _from_classes(_Private, "model_post_init")
+_WRAPPER = _from_classes(_Wrapped, "model_post_init")
+_WRAPPER_CODE = getattr(_WRAPPER, "__code__", object())
+_WRAPPER_GLOBALS = getattr(_WRAPPER, "__globals__", object())
+_WRAPPER_CLOSURE = _closure(_WRAPPER)
+_WRAPPED_CELLS = [
+    index for index, held in enumerate(_WRAPPER_CLOSURE) if held is _post_init
+]
+_WRAPPED_CELL = _WRAPPED_CELLS[0] if len(_WRAPPED_CELLS) == 1 else None
+
+
 def _only_initialises_private_attributes(cls: type[Any]) -> bool:
     """True if the record's model_post_init is Pydantic's own, for private attributes.
 
     Pydantic sets ``model_post_init`` to ``init_private_attributes`` when a
-    record has private attributes, and wraps it, keeping ``__wrapped__``, when
-    a model_post_init already exists, such as one inherited from a record that
-    has private attributes too (pydantic/_internal/_model_construction.py,
-    ``ModelMetaclass.__new__``, at 2.12 and 2.14). Following ``__wrapped__``
-    must end at ``init_private_attributes``; anything an author wrote ends
-    elsewhere.
+    record has private attributes. When a model_post_init already exists, such
+    as one inherited from a record that has private attributes too, it sets a
+    wrapper that runs ``init_private_attributes`` and then the existing one,
+    held in a closure cell (pydantic/_internal/_model_construction.py,
+    ``ModelMetaclass.__new__``, at 2.12 and 2.14). The walk follows what the
+    wrapper runs: through functions with its code, globals and other cells, to
+    the function each holds, it must end at ``init_private_attributes``. It
+    never reads ``__wrapped__``, which anyone can set.
     """
-    function = getattr(cls, "model_post_init", None)
+    function = _from_classes(cls, "model_post_init")
     for _ in range(64):
-        if function is init_private_attributes:
+        if function is _INIT_PRIVATE_ATTRIBUTES:
             return True
-        wrapped = getattr(function, "__wrapped__", None)
-        # functools.wraps copies the name, so the wrapper is known by its code.
-        code = getattr(function, "__code__", None)
-        if wrapped is None or getattr(code, "co_name", "") != "wrapped_model_post_init":
+        held = _closure(function)
+        if (
+            _WRAPPED_CELL is None
+            or type(function) is not types.FunctionType
+            or function.__code__ is not _WRAPPER_CODE
+            or function.__globals__ is not _WRAPPER_GLOBALS
+            or len(held) != len(_WRAPPER_CLOSURE)
+            or any(
+                held[index] is not _WRAPPER_CLOSURE[index]
+                for index in range(len(held))
+                if index != _WRAPPED_CELL
+            )
+        ):
             return False
-        function = wrapped
+        function = held[_WRAPPED_CELL]
     return False
 
 
