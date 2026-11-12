@@ -29,7 +29,7 @@ Every value that crosses a call, whether a request, a reply or an error's detail
 
 **TRN-10.** A sender MUST write a value as JSON text by the rules of its declared type that the contract's description is derived from (CON-16), once converted as CON-35 and CON-36 say. Nothing a value or its type overrides, such as its own way of writing itself as JSON, changes the text.
 
-**TRN-11.** A sender MUST refuse a value that holds, at any depth, something its declared type does not hold at that place, such as text in an integer field, rather than write it in another form. A place holds a value only when the JSON text written for it reads back as an equal value of the same form. So a boolean in an integer field is refused although it could be written as `1`, and so is an integer in a number field that no double equals. A value of a subtype of a place's type, such as a member of an integer enumeration in an integer field, is refused too, and a map's key is held only as exactly a string, since the reader hands on a value of the type itself. A date or a timestamp of a subtype is the one exception: it is held as the date or the instant it is.
+**TRN-11.** A sender MUST refuse a value that holds, at any depth, something its declared type does not hold at that place, such as text in an integer field, rather than write it in another form. A place holds a value only when the JSON text written for it reads back as an equal value of the same form. So a boolean in an integer field is refused although it could be written as `1`, and so is an integer in a number field that no double equals. A value of a subtype of a place's type, such as a member of an integer enumeration in an integer field, is refused too, and a map's key is held only as exactly a string, since the reader hands on a value of the type itself. A date of a subtype other than a timestamp, and a timestamp of a subtype, are the one exception: each is held as the date or the instant it is.
 
 **TRN-15.** A sender MUST NOT send a value, whether a request, a reply or an error's detail record, whose JSON text the contract's published description (CON-16) refuses, or that breaks a rule the description cannot state (CON-40).
 
@@ -46,6 +46,16 @@ Every value that crosses a call, whether a request, a reply or an error's detail
 **TRN-6.** The in-process transport MUST run the provider's action in the caller's thread of control, so that attached mode has no hidden concurrency.
 
 Because the action runs in the caller's thread, the in-process transport checks the deadline before it dispatches the call and again when the action ends. If the deadline has passed by then, the action's reply, or a failure it ends with, is discarded and the call fails with `timeout`; the provider's host still records a discarded failure. A signal to stop, such as cancellation or the process exiting, is not a failure of the action and is not discarded. The action might have run, so `timeout` leaves the outcome unknown, as it does over a network.
+
+## Connectors
+
+A *connector* is what calling code holds to call one contract version. It runs the caller's checks (ADR 0017, Decision 9), then hands the call to a transport.
+
+**TRN-16.** A connector MUST let its caller call each action of its contract version by name, with one request of the action's request type, and return the action's reply. A call to an action the contract version does not have, or without exactly one request, is a mistake in the calling code (CON-29).
+
+**TRN-17.** A connector with the `single` policy MUST NOT send a call more than once, or to any provider but its one.
+
+**TRN-18.** A reply that its provider cannot send under TRN-9 to TRN-11 and TRN-15, or that the caller cannot read under TRN-12, MUST reach the caller as `internal`. That includes a reply to an action whose reply is empty, and a missing reply to one whose reply is not.
 
 ## Providers and routing
 
