@@ -6,7 +6,7 @@ An ADR captures one significant decision: the context, the options considered, w
 
 - **When to write one:** a decision is hard to reverse, shapes public API, or will be questioned later. Small, reversible choices do not need one.
 - **Numbering:** sequential, `NNNN-short-title.md`. Numbers are never reused.
-- **Status:** `Proposed` → `Accepted` (or `Rejected`). A later decision that reverses one is a new ADR. It marks the old one `Superseded by NNNN` and links back. We never delete or rewrite an accepted ADR's decision.
+- **Status:** `Proposed` → `Accepted` (or `Rejected`). A later decision that reverses one is a new ADR. It marks the old one `Superseded by NNNN` and links back. To narrow part of it, the new record quotes the sentences it narrows, and the old record gains a line under its status, `Narrowed by NNNN (Decision k)`; nothing else in it changes. We never delete or rewrite an accepted ADR's decision.
 - **Who decides:** anyone can propose. The maintainer accepts.
 
 Questions not yet decided are in [open-questions.md](../open-questions.md).
@@ -37,3 +37,4 @@ Questions not yet decided are in [open-questions.md](../open-questions.md).
 | [0020](0020-wire-forms-pydantic-writes-otherwise-are-neolith-annotated-types.md) | A portable form whose wire spelling differs from Pydantic's default is a neolith Annotated type | Accepted |
 | [0021](0021-an-app-declares-itself-on-its-neolithappconfig.md) | An app declares itself in class attributes of its `NeolithAppConfig`, with contracts named by their declaration classes | Proposed |
 | [0022](0022-the-app-host-builds-settings-and-checks-before-it-serves.md) | The app host builds settings from declarations, checks at app loading, and boots when a handler is built | Proposed |
+| [0023](0023-a-request-principal-comes-from-ordered-backends.md) | A request's principal comes from ordered backends that declare their request inputs, and a Django user is named by a deployer-given issuer and its primary key | Proposed |
