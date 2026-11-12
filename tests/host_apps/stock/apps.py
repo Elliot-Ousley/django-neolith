@@ -9,7 +9,8 @@ class StockConfig(NeolithAppConfig):
         Provided(
             Stock,
             implementation="tests.host_apps.stock.services.StockService",
-            principal_from=(),
+            principal_from=("web",),
         ),
     )
-    requires = (Couriers,)
+    # It calls its own contract too, which it lists like any other.
+    requires = (Couriers, Stock)
