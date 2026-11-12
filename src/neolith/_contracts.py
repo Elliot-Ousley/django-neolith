@@ -217,6 +217,45 @@ def _private_copy(value: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     return top, None
 
 
+def _untyped_copy(value: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """A private copy of an untyped detail, and why it breaks CON-30, if it does."""
+    copied, problem = _private_copy(value)
+    if problem is None:
+        problem = json_value_problem(copied, _UNTYPED_DEPTH)
+    return copied, problem
+
+
+def untyped_problem(value: object) -> str | None:
+    """Say why a value read from JSON is not an untyped detail (CON-30), or None."""
+    if type(value) is not dict:
+        return "it is not a map"
+    return _untyped_copy(typing.cast(dict[str, Any], value))[1]
+
+
+def mark_received(error: "ContractError") -> None:
+    """Mark an error as one a connector raised, so a provider's host that sees
+    it end an action knows the action did not raise it itself."""
+    error._received = True
+
+
+def is_received(error: "ContractError") -> bool:
+    """Whether a connector raised this error (``mark_received``)."""
+    return getattr(error, "_received", False) is True
+
+
+def _rebuilt(
+    kind: str,
+    message: str,
+    data: BaseModel | dict[str, Any] | None,
+    received: bool,
+) -> "ContractError":
+    """A ``ContractError`` rebuilt from a copy or a pickle."""
+    error = ContractError(kind, message, data)
+    if received is True:
+        mark_received(error)
+    return error
+
+
 def _freeze(value: object) -> object:
     """A frozen copy of a private, checked JSON value (at most 32 levels deep)."""
     if type(value) is dict:
@@ -254,14 +293,15 @@ class ContractError(Exception):
     would not survive a transport, so callers could tell the modes apart.
     Building one wrongly raises ``TypeError`` or ``ValueError``, never a
     ``ContractError``, so that code handling contract errors does not swallow
-    a bug. A copy or a pickle carries the kind, message and detail only, not
-    notes or other attributes.
+    a bug. A copy or a pickle carries the kind, message and detail, and
+    whether a connector raised the error, but not notes or other attributes.
     """
 
-    __slots__ = ("_data", "_kind", "_message")
+    __slots__ = ("_data", "_kind", "_message", "_received")
     _kind: str
     _message: str
     _data: BaseModel | dict[str, Any] | None
+    _received: bool
 
     def __init__(
         self,
@@ -302,9 +342,7 @@ class ContractError(Exception):
                 )
         elif type(data) is dict or type(data) is _FrozenMap:
             # Copy first, then check the copy, which nothing else can change.
-            copied, problem = _private_copy(data)
-            if problem is None:
-                problem = json_value_problem(copied, _UNTYPED_DEPTH)
+            copied, problem = _untyped_copy(data)
             if problem is not None:
                 raise TypeError(
                     f"the untyped detail of a {kind!r} error is a dict of JSON "
@@ -349,9 +387,13 @@ class ContractError(Exception):
         )
 
     def __reduce__(self) -> tuple[Any, ...]:
-        # Kind, message and detail only: no notes, no other attributes, and the
-        # detail is checked again when the copy is built.
-        return (ContractError, (self._kind, self._message, _thaw(self._data)))
+        # Kind, message and detail only, and whether a connector raised it: no
+        # notes, no other attributes, and the detail is checked again when the
+        # copy is built. A copy of a received error is still a received one.
+        return (
+            _rebuilt,
+            (self._kind, self._message, _thaw(self._data), is_received(self)),
+        )
 
     def __str__(self) -> str:
         try:
