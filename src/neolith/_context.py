@@ -6,11 +6,12 @@ key and the calling app, which belong to one call; and the id of the scope
 that issued it, which never leaves this host.
 
 Scopes are private. The host opens one at each root and around each action it
-runs, and closes it when that ends. One context variable holds the scope a
-connector call derives its context from; a call may name another open scope
-with ``context=``, which is matched by its scope id and never read. This
-variable is state the host owns (CONTRIBUTING K6): app code has no way to read
-it.
+runs, and closes it when that ends; code opens a root of its own, for a
+command or background work, with ``neolith.command_scope``. One context
+variable holds the scope a connector call derives its context from; a call
+may name another open scope with ``context=``, which is matched by its scope
+id and never read. This variable is state the host owns (CONTRIBUTING K6):
+app code has no way to read it.
 
 A principal is checked through its sent form (spec 03): its JCS serialization
 in UTF-8, whose base64url encoding is at most 4096 bytes, read by the same
@@ -53,11 +54,23 @@ type _Claim = str | int | bool | tuple[str, ...]
 class UsageError(RuntimeError):
     """A mistake in the calling code about the host: its state or what it holds.
 
-    Raised for a connector call made in no open scope, or naming a scope that
-    has closed; for a call to a contract the calling app's declaration does
-    not require; for a call made before the host is set up; and for a
-    contract the host does not know. It is not a ``ContractError`` (spec 01,
-    CON-29), so code that handles contract errors does not swallow it.
+    It is not a ``ContractError`` (spec 01, CON-29), so code that handles
+    contract errors does not swallow it. Raised:
+
+    - by a connector call made in no open scope, in one that has closed, or
+      naming with ``context=`` a scope that has closed or that this host did
+      not issue;
+    - by a connector call whose calling app's declaration does not require
+      the contract, or whose app has no declaration;
+    - by a connector call made before set-up has finished, or while an
+      override leaves neolith's app out of the registry, and by one to a
+      contract no app of the host provides;
+    - by ``connect()`` for a contract the host, once set up, does not know;
+    - by entering a ``command_scope`` before set-up has finished or while an
+      override leaves neolith's app out, for an app that is not hosted, or a
+      second time; and by its exit when it is not the current scope where
+      its block ends, or is current there but in another context than it was
+      entered in, unless the block ends with a signal to stop.
     """
 
 
@@ -504,8 +517,7 @@ def _hex(size: int) -> str:
             return found
 
 
-@contextlib.contextmanager
-def opened(
+def begin(
     *,
     principal: Principal | None,
     trace_id: str,
@@ -515,12 +527,11 @@ def opened(
     caller: str | None,
     app: str | None,
     requires: frozenset[str] | None,
-) -> Iterator[Scope]:
-    """Open a scope, make it the ambient one, and close it on the way out.
+) -> tuple[Scope, contextvars.Token[Scope | None]]:
+    """Open a scope and make it the ambient one; return it with the token
+    that resets the variable.
 
-    The scope issues a new context with a span identifier of its own. It is
-    closed when the block ends, by return or by any exception, so a context
-    kept past its call or root is refused (ADR 0017 Decision 3).
+    The scope issues a new context with a span identifier of its own.
     """
     scope_id = secrets.token_hex(16)
     scope = Scope(
@@ -539,13 +550,47 @@ def opened(
     )
     with _OPEN_LOCK:
         _OPEN[scope_id] = scope
-    token = _CURRENT.set(scope)
+    return scope, _CURRENT.set(scope)
+
+
+def close(scope: Scope) -> None:
+    """Close a scope, so that a call made in it or naming it is refused."""
+    scope.closed = True
+    with _OPEN_LOCK:
+        _OPEN.pop(scope.context.scope_id, None)
+
+
+@contextlib.contextmanager
+def opened(
+    *,
+    principal: Principal | None,
+    trace_id: str,
+    tracestate: str,
+    deadline: float | None,
+    idempotency_key: str | None,
+    caller: str | None,
+    app: str | None,
+    requires: frozenset[str] | None,
+) -> Iterator[Scope]:
+    """Open a scope, make it the ambient one, and close it on the way out.
+
+    It is closed when the block ends, by return or by any exception, so a
+    context kept past its call or root is refused (ADR 0017 Decision 3).
+    """
+    scope, token = begin(
+        principal=principal,
+        trace_id=trace_id,
+        tracestate=tracestate,
+        deadline=deadline,
+        idempotency_key=idempotency_key,
+        caller=caller,
+        app=app,
+        requires=requires,
+    )
     try:
         yield scope
     finally:
-        scope.closed = True
-        with _OPEN_LOCK:
-            del _OPEN[scope_id]
+        close(scope)
         # A block left in another context than it was entered in cannot reset
         # the variable there; the scope it still names is closed.
         with contextlib.suppress(ValueError):
@@ -606,6 +651,38 @@ def timeout_option(timeout: object) -> float | None:
     return float(max(min(seconds, limit), -limit))
 
 
+def root_fields(
+    app: str | None = None,
+    *,
+    requires: tuple[str, ...] | None = None,
+    principal: Principal | None = None,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """The fields of a root that is not itself a call, checked.
+
+    It starts a new trace and has no key and no caller. ``app`` is the app it
+    runs for, the caller of the calls made from it, and ``requires`` the
+    identities its declaration requires, or ``None`` for an app with no
+    declaration. It has no deadline unless ``timeout`` gives one, in seconds
+    from now.
+    """
+    if principal is not None and type(principal) is not Principal:
+        raise TypeError(
+            f"principal= takes a Principal, not {type(principal).__qualname__}"
+        )
+    seconds = timeout_option(timeout)
+    return {
+        "principal": principal,
+        "trace_id": _hex(16),
+        "tracestate": "",
+        "deadline": None if seconds is None else now() + seconds,
+        "idempotency_key": None,
+        "caller": None,
+        "app": _app(app),
+        "requires": requires_option(requires),
+    }
+
+
 def root(
     app: str | None = None,
     *,
@@ -613,28 +690,9 @@ def root(
     principal: Principal | None = None,
     timeout: float | None = None,
 ) -> contextlib.AbstractContextManager[Scope]:
-    """Open a root that is not itself a call, as for a command or a test.
-
-    Private until the host opens roots (roadmap step 4, #11). It starts a new
-    trace and has no key and no caller. ``app`` is the app it runs for, the
-    caller of the calls made from it, and ``requires`` the identities its
-    declaration requires, or ``None`` for an app with no declaration. It has
-    no deadline unless ``timeout`` gives one, in seconds from now.
-    """
-    if principal is not None and type(principal) is not Principal:
-        raise TypeError(
-            f"principal= takes a Principal, not {type(principal).__qualname__}"
-        )
-    seconds = timeout_option(timeout)
+    """Open the test harness's root, with the fields ``root_fields`` checks."""
     return opened(
-        principal=principal,
-        trace_id=_hex(16),
-        tracestate="",
-        deadline=None if seconds is None else now() + seconds,
-        idempotency_key=None,
-        caller=None,
-        app=_app(app),
-        requires=requires_option(requires),
+        **root_fields(app, requires=requires, principal=principal, timeout=timeout)
     )
 
 
@@ -686,7 +744,8 @@ def parent(context: object) -> Scope:
             raise UsageError(
                 "the call context passed as context= names no open scope on "
                 "this host: its call or scope has ended, or it was not issued "
-                "here. Work that outlives its call opens a scope of its own"
+                "here. Work that outlives its call opens a root of its own with "
+                'neolith.command_scope("<label>")'
             )
         return found
     ambient = _CURRENT.get()
@@ -694,13 +753,17 @@ def parent(context: object) -> Scope:
         raise UsageError(
             "a connector call needs a call context, and none is active here. "
             "Make the call from inside an action or another scope the host "
-            "opened, or pass context=; a thread the app starts does not "
-            "inherit the context"
+            "opened, or pass context=; a thread the app starts inherits the "
+            "context only from Python 3.14 with thread_inherit_context set. "
+            "Code that runs outside any call, such as a command or background "
+            "work, opens one with "
+            'neolith.command_scope("<label>")'
         )
     if ambient.closed:
         raise UsageError(
             "the call context active here belongs to a call or scope that has "
-            "ended. Work that outlives its call opens a scope of its own"
+            "ended. Work that outlives its call opens a root of its own with "
+            'neolith.command_scope("<label>")'
         )
     return ambient
 
@@ -718,7 +781,7 @@ def check_required(scope: Scope, identity: str) -> None:
         return
     elsewhere = (
         "code that runs in another app's scope on its own app's account opens "
-        "a scope that names its own app"
+        'neolith.command_scope("<its label>")'
     )
     if requires is None:
         raise UsageError(

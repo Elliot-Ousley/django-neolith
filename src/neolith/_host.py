@@ -26,6 +26,7 @@ State the host owns (CONTRIBUTING K6), all of it guarded by one lock:
 """
 
 import contextlib
+import contextvars
 import importlib
 import inspect
 import logging
@@ -41,9 +42,10 @@ from django.apps.registry import Apps
 from django.core.exceptions import ImproperlyConfigured
 from pydantic import BaseModel
 
+from neolith import _context
 from neolith._connector import Connector as Bound
 from neolith._connector import InProcess
-from neolith._context import UsageError
+from neolith._context import Principal, UsageError
 from neolith._contracts import _IDENTITY, Contract
 from neolith._declaration import (
     Declaration,
@@ -54,7 +56,7 @@ from neolith._declaration import (
     declaration_of,
 )
 
-__all__ = ["HostConfig", "connect"]
+__all__ = ["HostConfig", "command_scope", "connect"]
 
 _log = logging.getLogger("neolith.host")
 
@@ -69,6 +71,8 @@ class Host:
 
     known: frozenset[str]
     connectors: Mapping[str, Bound]
+    # Each hosted app's label, with the identities its declaration requires.
+    apps: Mapping[str, tuple[str, ...]]
 
 
 _LOCK: Final = threading.Lock()
@@ -254,6 +258,14 @@ def build(registry: Apps) -> tuple[Host, list[str]]:
         Host(
             known=frozenset(contracts),
             connectors=types.MappingProxyType(connectors),
+            apps=types.MappingProxyType(
+                {
+                    declaration.label: tuple(
+                        required.identity for required in declaration.requires
+                    )
+                    for _, declaration in hosted
+                }
+            ),
         ),
         refusals,
     )
@@ -481,8 +493,26 @@ def connect(identity: str, /) -> "Connector":
     ``identity`` is ``<name>.v<N>``, a contract a hosted app provides or
     requires. ``connect()`` may run at import: before the host is set up, the
     identity is recorded, and set-up stops the host if no app knows it; after,
-    an identity the host does not know is a ``UsageError`` at once. A call
-    through the connector is a ``UsageError`` until set-up has finished.
+    an identity the host does not know is a ``UsageError`` at once.
+
+    A call through the connector raises ``UsageError``, never a contract
+    error, when it is made before set-up has finished or while an override
+    leaves neolith's app out of the registry; when no app of the host
+    provides the contract; when it is made in no open scope or in one that
+    has closed; when it names with ``context=`` a scope that has closed or
+    that this host did not issue; and when the calling app's declaration does
+    not require the contract, or the app has none.
+
+    Args:
+        identity: The contract version, ``<name>.v<N>``.
+
+    Returns:
+        A connector that holds only ``identity``.
+
+    Raises:
+        TypeError: If ``identity`` is not a ``str``.
+        ValueError: If ``identity`` is not of the form ``<name>.v<N>``.
+        UsageError: If the host is set up and knows no contract ``identity``.
     """
     if type(identity) is not str:
         raise TypeError(
@@ -619,3 +649,229 @@ def _connector(identity: str) -> Bound:
             f"connector to {identity}: no app of this host provides it; {_knows(host)}"
         )
     return found
+
+
+def command_scope(
+    app: str,
+    *,
+    principal: Principal | None = None,
+    timeout: float | None = None,
+) -> contextlib.AbstractContextManager[None]:
+    """Open a root for a command or background work, run for a hosted app.
+
+    Use it once, with ``with``, in sync and async code alike. Calls made in
+    the block call as ``app``, are checked against what its declaration
+    requires, and carry ``principal``. The root takes nothing from a scope it
+    is opened in: it starts a new trace, and has a deadline only when
+    ``timeout`` is given, counted from entry. The root closes on exit,
+    however the block ends, so a call made in it afterwards, or naming its
+    context, is a ``UsageError``.
+
+    An ``await`` inside the block is fine. A generator that yields inside
+    the block must finish, or be closed, where the scope is still current,
+    in the context that entered it; roots opened in the block close first.
+    Then the enclosing scope is current again on exit. A scope that finds itself
+    not current where its block ends, or cannot be reset there, still closes,
+    and its exit raises ``UsageError``, with the block's own exception, if
+    any, as its context; calls in the context it was left current in are
+    refused, since it has closed. A signal to stop that the block ends with
+    (cancellation, ``KeyboardInterrupt``, ``SystemExit``) is never replaced:
+    it propagates, with the report added to it as a note and logged on the
+    ``neolith.host`` logger.
+
+    The arguments are checked when it is called, and the host on entry.
+
+    Args:
+        app: The label of a hosted app: an installed app whose config class
+            declares it.
+        principal: On whose behalf the calls are made, or ``None``.
+        timeout: The root's deadline, in seconds from entry, or ``None`` for
+            none. Zero or less gives a root whose calls fail with
+            ``timeout``.
+
+    Returns:
+        A context manager whose ``with`` block is the root; it yields
+        nothing.
+
+    Raises:
+        TypeError: If ``app`` is not a ``str``, ``principal`` not a
+            ``Principal`` or ``None``, or ``timeout`` not an ``int``, a
+            ``float`` or ``None`` (a ``bool`` is refused).
+        ValueError: If ``timeout`` is not finite.
+        UsageError: On entry, if the host is not set up, if ``app`` is not
+            the label of a hosted app, or if the scope was opened before; a
+            refused entry opens nothing, and can be tried again. On exit,
+            if the scope is not the one current where its block ends, or is
+            current there but in another context than it was entered in;
+            unless the block ends with a signal to stop.
+    """
+    if type(app) is not str:
+        raise TypeError(
+            "command_scope() takes an app's label as a str, not "
+            f"{type(app).__qualname__}"
+        )
+    if principal is not None and type(principal) is not Principal:
+        raise TypeError(
+            f"principal= takes a Principal, not {type(principal).__qualname__}"
+        )
+    return _CommandScope._made(app, principal, _context.timeout_option(timeout))
+
+
+@final
+class _CommandScope:
+    """One command scope, entered at most once."""
+
+    __slots__ = (
+        "_app",
+        "_entered",
+        "_lock",
+        "_principal",
+        "_scope",
+        "_timeout",
+        "_token",
+    )
+
+    _app: str
+    _principal: Principal | None
+    _timeout: float | None
+    _entered: bool
+    _lock: threading.Lock
+    _scope: _context.Scope | None
+    _token: contextvars.Token[_context.Scope | None] | None
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("a command scope is made by neolith.command_scope()")
+
+    @classmethod
+    def _made(
+        cls, app: str, principal: Principal | None, timeout: float | None
+    ) -> "_CommandScope":
+        made = object.__new__(cls)
+        made._app = app
+        made._principal = principal
+        made._timeout = timeout
+        made._entered = False
+        made._lock = threading.Lock()
+        made._scope = None
+        made._token = None
+        return made
+
+    def __enter__(self) -> None:
+        # One lock around the checks and the opening, so that of two threads
+        # entering one scope, exactly one opens it. A refused entry opens
+        # nothing and leaves the scope as it was.
+        with self._lock:
+            if self._entered:
+                raise UsageError(
+                    f"{self._where()}: a command scope is entered once, and this "
+                    "one was entered before; call command_scope() again for a "
+                    "new root"
+                )
+            fields = _context.root_fields(
+                self._app,
+                requires=self._requires(),
+                principal=self._principal,
+                timeout=self._timeout,
+            )
+            self._scope, self._token = _context.begin(**fields)
+            self._entered = True
+
+    def _where(self) -> str:
+        return f"command_scope({_quoted(self._app)})"
+
+    def _requires(self) -> tuple[str, ...]:
+        """What the named app requires, from the table of the set-up that
+        Django's global registry holds now; ``UsageError`` when there is no
+        such table or the app is not hosted.
+        """
+        with _LOCK:
+            host, installed = _table()
+        if host is None:
+            raise UsageError(
+                f"{self._where()}: the host is not set up yet. A command scope "
+                "opens once Django has loaded every app and neolith's set-up "
+                "has passed"
+            )
+        if not installed:
+            raise UsageError(
+                f"{self._where()}: the host is not set up: neolith's app is not in "
+                "Django's registry while an override or set_available_apps "
+                "leaves it out"
+            )
+        requires = host.apps.get(self._app)
+        if requires is None:
+            hosted = ", ".join(sorted(host.apps)) or "none"
+            raise UsageError(
+                f"{self._where()}: {_quoted(self._app)} is not a hosted app; the "
+                f"hosted apps are {hosted}. A scope is named by an app's label, "
+                "and an app is hosted when its config class declares it (a "
+                "NeolithAppConfig subclass)"
+            )
+        return requires
+
+    def __exit__(
+        self,
+        kind: type[BaseException] | None,
+        error: BaseException | None,
+        traceback: types.TracebackType | None,
+    ) -> None:
+        scope, token = self._scope, self._token
+        self._scope = self._token = None
+        if scope is None or token is None:
+            return
+        current = _context._CURRENT.get() is scope
+        _context.close(scope)
+        if current:
+            try:
+                _context._CURRENT.reset(token)
+            except ValueError:
+                found = (
+                    "the scope is current where its block ends, but in another "
+                    "context than the one it was entered in"
+                )
+            else:
+                return
+        else:
+            found = (
+                "the scope is not the current scope where its block ends: a "
+                "root opened in it is still open, its block was left in "
+                "another context than it was entered in, or another scope was "
+                "made current after it was entered, such as around a generator "
+                "suspended inside it"
+            )
+        # The state found is not the one the block opened: say so, rather
+        # than leave a context where calls fail later for no visible reason.
+        report = (
+            f"{self._where()}: {found}, so the scope it was opened in cannot be "
+            "made current again there. The scope has closed. Open and close a "
+            "command scope in one block that does not yield, and close the "
+            "roots opened in it first"
+        )
+        if error is not None and not isinstance(error, Exception):
+            # A signal to stop, such as cancellation, KeyboardInterrupt or
+            # SystemExit, is never replaced: it goes on, carrying the report.
+            # It is logged too, since a GeneratorExit that closes a generator
+            # is swallowed with its notes.
+            error.add_note(f"neolith.UsageError: {report}")
+            with contextlib.suppress(Exception):
+                _log.error("%s", report)
+            return
+        raise UsageError(report)
+
+    def __repr__(self) -> str:
+        return f"<command scope for {_quoted(self._app)}>"
+
+    def __copy__(self) -> NoReturn:
+        raise TypeError(self._unique())
+
+    def __deepcopy__(self, memo: object) -> NoReturn:
+        raise TypeError(self._unique())
+
+    def __reduce_ex__(self, protocol: object) -> NoReturn:
+        raise TypeError(self._unique())
+
+    def _unique(self) -> str:
+        return (
+            "a command scope is one root and cannot be copied or pickled: "
+            "call command_scope() again where a root is needed"
+        )
