@@ -1,6 +1,6 @@
 # 05. App declaration and lifecycle
 
-**Status:** outline, except the form of a declaration, Resolve and Validate, which are specified. The rest of the lifecycle becomes requirements with the host (#11).
+**Status:** outline, except the form of a declaration, Resolve and Validate, and the checks before Serve, which are specified. The rest of the lifecycle becomes requirements with the host (#11).
 
 ## Declaration
 
@@ -71,6 +71,14 @@ A host takes a set of apps through these phases in order. **APP-1.** A failure i
 Schema changes are not part of the lifecycle. They are an explicit step, run once per database before hosts that serve the app start. Several hosts can serve the same app at once ([ADR 0016](../docs/adr/0016-an-app-may-run-attached-and-detached-at-once.md)), and they must never race on its schema.
 
 A host running one app is a detached deployment. A host running several is a shared process. The host is the same program in both cases.
+
+### Before Serve
+
+**APP-16.** A host MUST stop before it serves when an input of its configuration is outside the set it admits, with a diagnostic that names the input.
+
+**APP-17.** When it loads its apps, a host MUST warn about each registration of the framework's generic data views, such as an administration site, whose code is in no app, since a call made from those views has no calling app and is refused ([02](02-transports.md), TRN-58).
+
+Other code in no app that serves requests is found by the checks that later steps add: when the host boots, and before deployment ([ADR 0022](../docs/adr/0022-the-app-host-builds-settings-and-checks-before-it-serves.md) Decisions 5 and 7).
 
 ### Resolve and Validate
 
