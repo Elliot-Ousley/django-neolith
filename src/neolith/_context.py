@@ -404,6 +404,28 @@ class Sent:
     caller: str | None
 
 
+@final
+@once
+@dataclass(frozen=True, slots=True)
+class Arrived:
+    """A call's context as the provider's side takes it from a transport.
+
+    The transport has run the provider's first three steps (ADR 0017
+    Decision 9): it knows the calling app, has checked the allow-list and has
+    read the principal from its sent form. ``deadline`` is counted from when
+    the call arrived, on this host's clock, or ``None`` for a call with no
+    deadline, and ``idempotency_key`` is ``None`` for a call that arrived
+    without one (ADR 0011 Decision 3).
+    """
+
+    principal: Principal | None
+    trace_id: str
+    tracestate: str
+    deadline: float | None
+    idempotency_key: str | None
+    caller: str
+
+
 class Resolver(typing.Protocol):
     """What answers for a request root's principal (``neolith._principal``)."""
 
@@ -776,27 +798,26 @@ def root(
 
 
 def received(
-    sent: Sent,
-    deadline: float | None,
+    arrived: Arrived,
     app: str | None,
     requires: frozenset[str] | None,
 ) -> contextlib.AbstractContextManager[Scope]:
     """The scope a provider's side runs an action in (ADR 0017 Decision 4).
 
-    It holds the principal read from its sent form, the caller's trace with a
-    span of its own, the call's key and caller, and ``deadline``, which the
-    transport counts from when the call arrived. ``app`` is the app the
-    provider belongs to, and ``requires`` what its declaration requires. The
-    principal is read here; the scope opens when the
-    result is entered.
+    It holds the context as the call arrived: the principal the transport
+    read, the caller's trace with a span of its own, the call's key, or none,
+    its caller, and the deadline the transport counted from when the call
+    arrived. ``app`` is the app the provider belongs to, and ``requires``
+    what its declaration requires. The scope opens when the result is
+    entered.
     """
     return opened(
-        principal=None if sent.principal is None else read_principal(sent.principal),
-        trace_id=sent.trace_id,
-        tracestate=sent.tracestate,
-        deadline=deadline,
-        idempotency_key=sent.idempotency_key,
-        caller=sent.caller,
+        principal=arrived.principal,
+        trace_id=arrived.trace_id,
+        tracestate=arrived.tracestate,
+        deadline=arrived.deadline,
+        idempotency_key=arrived.idempotency_key,
+        caller=arrived.caller,
         app=app,
         requires=requires,
     )

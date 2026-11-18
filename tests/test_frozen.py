@@ -30,7 +30,7 @@ import neolith
 from neolith import Action, CallContext, ContractError, Principal, Provided
 from neolith._caller import Built as CallerBuilt
 from neolith._caller import Callers, Findings
-from neolith._context import Sent
+from neolith._context import Arrived, Sent
 from neolith._contracts import _FrozenList, _FrozenMap
 from neolith._declaration import Declaration, Provision
 from neolith._forms import _Form
@@ -92,6 +92,11 @@ _CASES: dict[type, Case] = {
         lambda: Sent(None, "a" * 32, "", 1000, "k", "shop"),
         ((b"p", "f" * 32, "x=1", None, "other", "admin"), {}),
         state=[b"p", "f" * 32, "x=1", None, "other", "admin"],
+    ),
+    Arrived: Case(
+        lambda: Arrived(_ALICE, "a" * 32, "", 5.0, "k", "shop"),
+        ((None, "f" * 32, "x=1", None, None, "other"), {}),
+        state=[None, "f" * 32, "x=1", None, None, "other"],
     ),
     Origin: Case(
         lambda: Origin.parse("https://inventory.test:8443"),
