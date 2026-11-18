@@ -16,7 +16,10 @@ does not run:
    no label the host reserves, no battery that is a hosted app or
    ``neolith``.
 3. **Resolve.** ADR 0021's function, whose refusals are one
-   ``DeclarationError``.
+   ``DeclarationError``, with the remote providers that the deployer's
+   ``NEOLITH["REMOTE_PROVIDERS"]`` names (ADR 0014). Resolve reads
+   ``NEOLITH``, so its refusals come with every problem found there, or
+   with the refusal of settings that are not a ``dict``.
 4. **Configure.** The deployer's mapping, row by row.
 
 ``settings_problems`` is the same Configure, run at the first set-up on the
@@ -95,7 +98,8 @@ def configure(
 
     Raises:
         DeclarationError: A hosted app's declaration is refused when its
-            class is defined, or Resolve refuses the hosted apps.
+            class is defined, or Resolve refuses the hosted apps or the
+            remote providers, with any problem of ``NEOLITH``.
         ImproperlyConfigured: Any other row of the builder's table refuses
             its input.
     """
@@ -107,7 +111,23 @@ def configure(
     declarations = [declaration for _, declaration in pairs]
     from neolith._host import resolve
 
-    _, refusals = resolve(declarations)
+    settings_given: dict[object, object] | None = (
+        deployer if type(deployer) is dict else None
+    )
+    neolith = (
+        None
+        if settings_given is None
+        else _naming.entry(settings_given, "NEOLITH", _checks.MISSING)
+    )
+    _, refusals = resolve(declarations, _checks.remote_identities(neolith))
+    if refusals:
+        # Resolve reads NEOLITH, so a requirement it finds unmet may come
+        # from a problem there, or from settings that are not a dict: those
+        # are reported with its refusals.
+        if settings_given is None:
+            refusals.append(_not_settings(deployer))
+        else:
+            refusals += _checks.neolith_problems(neolith, declarations)
     if refusals:
         raise DeclarationError("\n".join(sorted(refusals)))
     names, problems = _names(deployer)
@@ -214,9 +234,7 @@ def _names(deployer: object) -> tuple[dict[str, Any], list[str]]:
     a ``str``, which Configure reports with its other refusals.
     """
     if type(deployer) is not dict:
-        raise ImproperlyConfigured(
-            f"settings: expected a dict of setting names, got {_type(deployer)}"
-        )
+        raise ImproperlyConfigured(_not_settings(deployer))
     entries: dict[object, object] = deployer
     problems = [
         f"settings: a setting name is a str, got {_type(name)}"
@@ -229,6 +247,10 @@ def _names(deployer: object) -> tuple[dict[str, Any], list[str]]:
         if type(name) is str and name.isupper()
     }
     return names, problems
+
+
+def _not_settings(deployer: object) -> str:
+    return f"settings: expected a dict of setting names, got {_type(deployer)}"
 
 
 def _deployer_problems(
