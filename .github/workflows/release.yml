@@ -65,6 +65,8 @@ jobs:
       # fails here.
       - name: Build the sdist and the wheel
         run: python -m build
+      - name: The sdist carries every tracked file
+        run: python scripts/sdist_check.py dist/*.tar.gz
       - name: Check the metadata
         run: python -m twine check --strict dist/*
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -137,7 +139,13 @@ jobs:
           sys.path.insert(0, str(root))
           settings.configure(**build_settings(
               ["smoke"],
-              {"MIDDLEWARE": ["neolith.middleware.RootMiddleware"], "NEOLITH": {}},
+              {
+                  "MIDDLEWARE": [
+                      "neolith.middleware.RootMiddleware",
+                      "neolith.middleware.PrincipalMiddleware",
+                  ],
+                  "NEOLITH": {},
+              },
           ))
           django.setup()
           print(f"neolith {neolith.__version__} on Django {django.get_version()}")

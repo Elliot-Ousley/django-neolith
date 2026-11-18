@@ -20,6 +20,7 @@ from django.apps import apps as global_apps
 from django.core.exceptions import ImproperlyConfigured
 
 from neolith._contracts import _SEGMENT, Contract, ContractDefinitionError
+from neolith._frozen import once
 
 _FIELDS: Final = ("provides", "requires", "resources", "batteries")
 _EVENT_FIELDS: Final = ("publishes", "subscribes")
@@ -83,6 +84,7 @@ _MISSING: Final = _Missing.MISSING
 
 
 @final
+@once
 class Provided:
     """One entry of ``provides``: a contract, its implementation, its allow-list.
 
@@ -103,8 +105,8 @@ class Provided:
 
     Nothing is checked here: the class body runs before the config class
     exists. ``NeolithAppConfig`` checks every entry with the rest of the
-    declaration, and its error names the app. An argument left out is refused
-    there too.
+    declaration, and its error names the app. An argument left out, which the
+    signature shows as ``<missing>``, is refused there too.
 
     Args:
         contract: The contract's class, which carries ``@contract``.
@@ -114,7 +116,8 @@ class Provided:
 
     Raises:
         TypeError: When a subclass is defined; ``Provided`` cannot be
-            subclassed.
+            subclassed. Calling ``__init__`` on an entry already built raises
+            it too.
     """
 
     __slots__ = ("_contract", "_implementation", "_principal_from")
@@ -166,6 +169,7 @@ def _rebuild_provided(
     )
 
 
+@once
 @dataclass(frozen=True, slots=True)
 class Provision:
     """A checked entry of ``provides``."""
@@ -175,6 +179,7 @@ class Provision:
     principal_from: tuple[str, ...]
 
 
+@once
 @dataclass(frozen=True, slots=True)
 class Declaration:
     """The snapshot of a declaring class, taken when its check passed.
@@ -232,6 +237,9 @@ class NeolithAppConfig(AppConfig):
 
     A subclass that does not set ``name`` is a base class. It, and any mixin,
     may hold ``default_auto_field``, ``verbose_name`` and ``ready`` only.
+    ``path`` and ``default`` describe one app, its directory and whether
+    Django picks this class from its ``apps`` module, so they are written in
+    the body of the class that sets ``name``.
 
     A declaration outside this form raises ``DeclarationError`` when the class
     is defined, listing every refusal.
